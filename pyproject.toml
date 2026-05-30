@@ -1,0 +1,15 @@
+[project]
+name = "magonodes"
+description = "MagoStudio Nodes for ComfyUI"
+version = "0.1.0"
+license = {file = "LICENSE"}
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/MagoStudio/ComfyUI-MagoNodes"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "sxela"
+DisplayName = "MagoNodes"
+Icon = ""
