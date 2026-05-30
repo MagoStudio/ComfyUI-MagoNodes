@@ -91,6 +91,69 @@ Guidance:
 - **25%** ≈ 160px at 1080p — recommended, handles moderate cross-tile motion
 - **50%** ≈ 320px at 1080p — tiled-VAE style, maximum continuity, ~2× compute
 
+## Multiscale (coarse-to-fine) scheduling
+
+Tiling solves the *spatial* token-count problem but not the *temporal coherence*
+problem in I2V.  Each tile runs its own denoising trajectory for motion, and
+while MultiDiffusion blending keeps the trajectories tied at the latent level,
+the model still decides motion per tile from local context.  In V2V the control
+video pins the motion, so tiles agree; in I2V there is no such pin and tiles
+drift apart over the sequence even though the first frame / reference is honoured.
+
+The fix is to decide global motion *before* tiling, at low resolution.  WAN's
+`rope_encode(t_len, h, w, …)` derives positional encodings directly from the
+latent's spatial dims, and `_forward` crops its output back to the input dims.
+So feeding a **downscaled whole-frame latent** into a single model call:
+
+- brings token count and positional encodings back inside the training range
+  (the original high-res motivation), and
+- gives the model the *entire* frame as context, so motion is decided once,
+  coherently, instead of per tile.
+
+### Two schedules
+
+`scale_schedule` maps step → resolution %, held until the next key:
+`{0:25, 10:50, 20:100}`.  While the scheduled scale is < 100% the wrapper
+downscales the latent and every spatially-shaped conditioning tensor, runs one
+whole-frame evaluation, and upscales the x0 prediction back (`bilinear`).
+Targets are rounded to the nearest even number so the spatial patch size (2)
+divides cleanly and the VACE `pad_to_patch_size` mismatch above cannot occur in
+the downscale path.  Tiling is skipped while scale < 100%.
+
+### Downscale method — preserving the noise level
+
+Unlike Kohya Deep Shrink (`PatchModelAddDownscale`), which downscales a *deep
+feature map* inside the UNet — where the noise has already been absorbed — this
+node downscales the *raw input latent* (the only lever a DiT like WAN exposes:
+its first op is patchify, so a smaller latent simply produces fewer tokens).
+
+That distinction matters at high sigma, where the latent is noise-dominated.
+Averaging downsamplers (`area`, `bilinear`) collapse the variance of i.i.d.
+noise — pooling a k×k block divides its variance by k² — so the model would
+receive a latent whose noise level no longer matches `timestep` and would emit
+pure noise in the generated frames (the conditioned frame 0 still looks fine,
+since its inpaint mask is applied at full resolution outside the wrapper).
+
+The fix: the **noisy latent is downscaled by subsampling (`nearest-exact`)**.
+Subsampling keeps every k-th sample, so the noise stays unit-variance and the
+level still matches sigma, for both flow- and eps-parameterised models.  The
+*conditioning* tensors (`c_concat`, `reference_latent`, `vace_context`) are clean
+signal, not noise, so they use antialiased `area`; `denoise_mask` uses
+`nearest-exact` to keep its values crisp.
+
+`tile_schedule` maps step → bypass flag (`1` = whole-frame, `0` = tile) and
+overrides the `bypass_tiling` toggle at full resolution.
+
+### Mapping a model call to a step
+
+ComfyUI calls the wrapper with the current **sigma** as `timestep`
+(`sampling_function(..., timestep=sigma)` in `comfy/samplers.py`), not a step
+index.  The node reproduces the exact sigma schedule
+(`KSampler(...).sigmas` plus the same `start_step`/`last_step` slicing as
+`KSampler.sample`) and maps each incoming sigma to the nearest per-step starting
+sigma.  This is robust to samplers that evaluate the model more than once per
+step — intermediate sigmas snap to the closest scheduled step.
+
 ## References
 
 - Bar-Tal et al. (2023). *MultiDiffusion: Fusing Diffusion Paths for Controlled

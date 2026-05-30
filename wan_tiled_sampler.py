@@ -41,54 +41,184 @@ def _make_window_1d(size, fade_left, fade_right, dtype, device):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MultiDiffusion wrapper
+# Multiscale scheduling helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False, reference_latent_full=False):
+def _parse_schedule(text):
     """
-    Returns a model_function_wrapper implementing per-step MultiDiffusion spatial
-    tiling for WAN models.
-
-    At each model call the wrapper:
-      1. Tiles the full noisy latent (B, C, F, H, W) into spatial patches.
-      2. Slices spatially-shaped conditioning tensors per tile:
-           c_concat       — (B, extra_ch, F, H, W)  Fun Control reference+mask
-           denoise_mask   — (B, C, F, H, W)          WAN2.2 inpainting mask
-           reference_latent — (B, C, H, W)           reference frame (WAN2.1 I2V)
-      3. Calls the model for each tile independently.
-      4. Blends tile predictions into a full-size output with pre-computed 2-D
-         trapezoidal windows (weights sum to 1.0 everywhere).
-
-    tile_specs: list of dicts with keys
-        h_start, h_end, w_start, w_end  — latent-space bounds
-        window_2d                        — (1,1,1,Ht,Wt) fp32 blend weights
-    existing_wrapper: outer model_function_wrapper to chain after tile call, or None.
+    Parse a lenient ``{step: value, ...}`` schedule string into a sorted list of
+    (step:int, value:float) pairs.  Accepts JSON-ish input without quoted keys,
+    e.g. ``{0:25, 10:50, 20:100}`` (commas optional, whitespace ignored).
+    Returns None for empty / unparseable input.
     """
-    def wrapper(model_fn, input_dict):
-        x_full = input_dict['input']
+    if text is None:
+        return None
+    s = text.strip()
+    if not s:
+        return None
+    s = s.strip("{}").strip()
+    if not s:
+        return None
+    pairs = []
+    # split on commas and/or whitespace, keep only "k:v" tokens
+    tokens = s.replace(",", " ").split()
+    for tok in tokens:
+        if ":" not in tok:
+            continue
+        k, _, v = tok.partition(":")
+        try:
+            pairs.append((int(float(k.strip())), float(v.strip())))
+        except ValueError:
+            continue
+    if not pairs:
+        return None
+    pairs.sort(key=lambda p: p[0])
+    return pairs
+
+
+def _schedule_lookup(sched, step):
+    """Value of the largest key <= step (held-until-next-key). Before the first
+    key, the first key's value extends backward."""
+    val = sched[0][1]
+    for k, v in sched:
+        if k <= step:
+            val = v
+        else:
+            break
+    return val
+
+
+def _round_even(x):
+    """Round to the nearest positive even integer (WAN spatial patch size is 2)."""
+    return max(2, int(round(x / 2.0)) * 2)
+
+
+def _resize_spatial(t, out_h, out_w, mode):
+    """
+    Resize only the last two (H, W) dims of a tensor, leaving every leading dim
+    (batch, channels, frames, refs, …) untouched.  Interpolation is independent
+    per channel/frame, so folding the leading dims into the batch axis is exact.
+    """
+    if t.shape[-2] == out_h and t.shape[-1] == out_w:
+        return t
+    lead = t.shape[:-2]
+    H, W = t.shape[-2], t.shape[-1]
+    x = t.reshape(-1, 1, H, W).float()
+    kwargs = {}
+    if mode in ("bilinear", "bicubic"):
+        kwargs["align_corners"] = False
+    x = torch.nn.functional.interpolate(x, size=(out_h, out_w), mode=mode, **kwargs)
+    return x.reshape(*lead, out_h, out_w).to(t.dtype)
+
+
+def _nearest_step(start_sigmas, sigma):
+    """Map an incoming sigma to a 0-based step index by nearest match against the
+    per-step starting sigmas.  Robust to samplers that evaluate the model more
+    than once per step (intermediate sigmas snap to the closest scheduled step)."""
+    best_i, best_d = 0, float("inf")
+    for i, s in enumerate(start_sigmas):
+        d = abs(s - sigma)
+        if d < best_d:
+            best_d, best_i = d, i
+    return best_i
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MultiDiffusion + multiscale wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False,
+                           reference_latent_full=False, default_tile_on=True,
+                           scale_sched=None, tile_sched=None, start_sigmas=None):
+    """
+    Returns a model_function_wrapper implementing, per denoising step:
+
+      * Multiscale (scale_sched): when the scheduled scale is < 100%, the whole
+        latent (and its spatially-shaped conditioning) is downscaled, evaluated
+        in a single full-frame pass, and the prediction upscaled back.  WAN
+        derives its RoPE positions from the latent's h/w, so a smaller latent
+        brings token count and positional encodings back in-distribution — this
+        keeps global motion coherent in I2V where independent per-tile motion
+        would otherwise drift.
+
+      * Per-step MultiDiffusion spatial tiling (at scale == 100%): the latent is
+        split into overlapping spatial tiles, each evaluated at a
+        training-distribution token count, and blended back with trapezoidal
+        windows (weights sum to 1.0 everywhere).
+
+    Tiling is skipped while scale < 100% (tiling a downscaled latent defeats the
+    purpose); the natural pairing is low-res whole-frame early → full-res tiled
+    late.  tile_sched (1 = bypass / whole-frame, 0 = tile) overrides
+    default_tile_on at scale == 100%.
+    """
+    sched_active = scale_sched is not None or tile_sched is not None
+    start_sigmas = start_sigmas or []
+    last_logged = [-1]
+
+    def _call_model(model_fn, d):
+        if existing_wrapper is not None:
+            return existing_wrapper(model_fn, d)
+        return model_fn(d["input"], d["timestep"], **d.get("c", {}))
+
+    def _run_downscaled(model_fn, input_dict, scale):
+        x_full = input_dict["input"]
+        H, W = x_full.shape[-2], x_full.shape[-1]
+        oh, ow = _round_even(H * scale / 100.0), _round_even(W * scale / 100.0)
+        if oh >= H and ow >= W:
+            return _call_model(model_fn, input_dict)
+
+        # Downscale the noisy latent by SUBSAMPLING (nearest), not averaging.
+        # At high sigma x is noise-dominated; averaging (area/bilinear) collapses
+        # the noise variance, so the model would receive a latent whose noise
+        # level no longer matches `timestep` and would emit garbage in the
+        # generated frames.  nearest-exact keeps every k-th sample, so the noise
+        # stays unit-variance and the level still matches sigma (works for both
+        # flow- and eps-parameterised models).  The clean conditioning tensors
+        # below are signal, not noise, so they use antialiased `area`.
+        x_small = _resize_spatial(x_full, oh, ow, "nearest-exact").contiguous()
+        c = dict(input_dict.get("c", {}))
+        for key in ("c_concat", "reference_latent", "vace_context"):
+            v = c.get(key, None)
+            if isinstance(v, torch.Tensor) and v.shape[-2] == H and v.shape[-1] == W:
+                c[key] = _resize_spatial(v, oh, ow, "area").contiguous()
+        dm = c.get("denoise_mask", None)
+        if isinstance(dm, torch.Tensor) and dm.shape[-2] == H and dm.shape[-1] == W:
+            c["denoise_mask"] = _resize_spatial(dm, oh, ow, "nearest-exact").contiguous()
+
+        d = {**input_dict, "input": x_small, "c": c}
+        pred = _call_model(model_fn, d)
+        # Always hand the sampler a full-resolution prediction: the sampler's
+        # latent state stays full-res across the whole run (and across WAN 2.2
+        # high/low-noise sampler passes), so the downscale never persists — the
+        # next pass always receives a full-res latent regardless of its schedule.
+        if isinstance(pred, torch.Tensor) and pred.shape[-2:] != (H, W):
+            pred = _resize_spatial(pred, H, W, "bilinear")
+        return pred.to(x_full.dtype) if isinstance(pred, torch.Tensor) else pred
+
+    def _run_tiled(model_fn, input_dict):
+        x_full = input_dict["input"]
         B, C, F, H, W = x_full.shape
-        dtype  = x_full.dtype
+        dtype = x_full.dtype
         device = x_full.device
 
         accum = torch.zeros(B, C, F, H, W, dtype=torch.float32, device=device)
         w_acc = torch.zeros(1, 1, F, H, W, dtype=torch.float32, device=device)
-
-        base_c = input_dict.get('c', {})
+        base_c = input_dict.get("c", {})
 
         for spec in tile_specs:
-            hs, he = spec['h_start'], spec['h_end']
-            ws, we = spec['w_start'], spec['w_end']
-            window_2d = spec['window_2d'].to(device=device, dtype=torch.float32)
+            hs, he = spec["h_start"], spec["h_end"]
+            ws, we = spec["w_start"], spec["w_end"]
+            window_2d = spec["window_2d"].to(device=device, dtype=torch.float32)
 
             tile_x = x_full[:, :, :, hs:he, ws:we].contiguous()
             tile_c = dict(base_c)
 
             # --- c_concat: (B, extra_ch, F, H, W) → slice spatial dims ---
-            cc = tile_c.get('c_concat', None)
+            cc = tile_c.get("c_concat", None)
             if cc is not None and isinstance(cc, torch.Tensor) and cc.dim() == 5:
                 try:
                     if cc.shape[-2] == H and cc.shape[-1] == W:
-                        tile_c['c_concat'] = cc[:, :, :, hs:he, ws:we].contiguous()
+                        tile_c["c_concat"] = cc[:, :, :, hs:he, ws:we].contiguous()
                     elif debug:
                         print(f"  [wan_tile] c_concat spatial mismatch: "
                               f"{tuple(cc.shape)} vs x {tuple(x_full.shape)}")
@@ -96,13 +226,13 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False, reference_
                     pass
 
             # --- denoise_mask: 5D (B,C,F,H,W) or 4D (B,F,H,W) → slice spatial dims ---
-            dm = tile_c.get('denoise_mask', None)
+            dm = tile_c.get("denoise_mask", None)
             if dm is not None and isinstance(dm, torch.Tensor):
                 try:
                     if dm.dim() == 5 and dm.shape[-2] == H and dm.shape[-1] == W:
-                        tile_c['denoise_mask'] = dm[:, :, :, hs:he, ws:we].contiguous()
+                        tile_c["denoise_mask"] = dm[:, :, :, hs:he, ws:we].contiguous()
                     elif dm.dim() == 4 and dm.shape[-2] == H and dm.shape[-1] == W:
-                        tile_c['denoise_mask'] = dm[:, :, hs:he, ws:we].contiguous()
+                        tile_c["denoise_mask"] = dm[:, :, hs:he, ws:we].contiguous()
                 except Exception:
                     pass
 
@@ -111,11 +241,11 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False, reference_
             # tile unchanged.  ref_conv appends its tokens to the sequence (no size
             # constraint), so the full image provides global scene context to all tiles.
             if not reference_latent_full:
-                rl = tile_c.get('reference_latent', None)
+                rl = tile_c.get("reference_latent", None)
                 if rl is not None and isinstance(rl, torch.Tensor) and rl.dim() == 4:
                     try:
                         if rl.shape[-2] == H and rl.shape[-1] == W:
-                            tile_c['reference_latent'] = rl[:, :, hs:he, ws:we].contiguous()
+                            tile_c["reference_latent"] = rl[:, :, hs:he, ws:we].contiguous()
                     except Exception:
                         pass
 
@@ -128,7 +258,7 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False, reference_
             # Fix: slice the vace tile then apply the same circular padding so both produce
             # the same token count.
             _WAN_PATCH_SIZE = (1, 2, 2)  # temporal × height × width
-            vc = tile_c.get('vace_context', None)
+            vc = tile_c.get("vace_context", None)
             if vc is not None and isinstance(vc, torch.Tensor) and vc.dim() == 6:
                 try:
                     if vc.shape[-2] >= he and vc.shape[-1] >= we:
@@ -142,9 +272,9 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False, reference_
                             # torch circular pad only supports up to 5D — reshape to 5D, pad, restore
                             B_vc, nr, ch_vc = tile_vc.shape[:3]
                             t5 = tile_vc.reshape(B_vc * nr, ch_vc, *tile_vc.shape[3:])
-                            t5 = torch.nn.functional.pad(t5, pad, mode='circular')
+                            t5 = torch.nn.functional.pad(t5, pad, mode="circular")
                             tile_vc = t5.reshape(B_vc, nr, ch_vc, *t5.shape[2:])
-                        tile_c['vace_context'] = tile_vc.contiguous()
+                        tile_c["vace_context"] = tile_vc.contiguous()
                         if debug:
                             print(f"  [wan_tile_debug] vace tile h:[{hs}:{he}] w:[{ws}:{we}] "
                                   f"pad={pad} → shape {tuple(tile_vc.shape)}")
@@ -159,11 +289,8 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False, reference_
                 print(f"  [wan_tile_debug] vace not sliced: type={type(vc).__name__} "
                       f"{'dim=' + str(vc.dim()) if isinstance(vc, torch.Tensor) else ''}")
 
-            tile_input_dict = {**input_dict, 'input': tile_x, 'c': tile_c}
-            if existing_wrapper is not None:
-                tile_pred = existing_wrapper(model_fn, tile_input_dict)
-            else:
-                tile_pred = model_fn(tile_x, input_dict['timestep'], **tile_c)
+            tile_input_dict = {**input_dict, "input": tile_x, "c": tile_c}
+            tile_pred = _call_model(model_fn, tile_input_dict)
 
             if isinstance(tile_pred, torch.Tensor) and tile_pred.shape == tile_x.shape:
                 accum[:, :, :, hs:he, ws:we] += tile_pred.float() * window_2d
@@ -177,6 +304,36 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False, reference_
 
         return (accum / w_acc.clamp(min=1e-8)).to(dtype)
 
+    def wrapper(model_fn, input_dict):
+        # Resolve the current step from the incoming sigma.
+        step = 0
+        if sched_active and start_sigmas:
+            try:
+                sigma = float(input_dict["timestep"].flatten()[0])
+                step = _nearest_step(start_sigmas, sigma)
+            except Exception:
+                step = 0
+
+        scale = 100.0 if scale_sched is None else max(1.0, min(100.0, _schedule_lookup(scale_sched, step)))
+        if tile_sched is None:
+            tile_on = default_tile_on
+        else:
+            tile_on = _schedule_lookup(tile_sched, step) < 0.5  # 0 = tile, 1 = bypass
+
+        do_tile = tile_on and len(tile_specs) > 1
+
+        if debug and step != last_logged[0]:
+            last_logged[0] = step
+            mode = ("downscale %d%% (whole-frame)" % round(scale)) if scale < 100 \
+                else ("tiled" if do_tile else "full")
+            print(f"[WanTiledSampler] step {step}: scale={round(scale)}% → {mode}")
+
+        if scale < 100:
+            return _run_downscaled(model_fn, input_dict, scale)
+        if do_tile:
+            return _run_tiled(model_fn, input_dict)
+        return _call_model(model_fn, input_dict)
+
     return wrapper
 
 
@@ -187,15 +344,22 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False, reference_
 class WanTiledSampler:
     """
     Drop-in replacement for KSamplerAdvanced with per-step MultiDiffusion spatial
-    tiling for WAN 2.1 / 2.2 models.
+    tiling and multiscale (coarse-to-fine) scheduling for WAN 2.1 / 2.2 models.
 
     Tiling keeps each spatial patch at training-distribution token counts, which
     prevents the hue shift / conditioning drift that appears when sampling very
-    large latents in a single pass.
+    large latents in a single pass.  This works well for V2V, where the
+    conditioning splits cleanly per tile.
 
-    Works with WAN Fun Control (Wan22FunControlToVideo) by slicing c_concat,
-    denoise_mask, and reference_latent per tile.  Temporal frames are never split
-    (spatial-only tiling), so causal temporal attention is never broken.
+    For I2V, independent per-tile motion drifts apart even when the first frame /
+    reference is honoured.  The multiscale schedule fixes this: run the *whole*
+    frame downscaled in the early (high-noise) steps so global motion is decided
+    coherently, then raise the resolution and hand off to tiling for detail.
+
+    Works with WAN Fun Control (Wan22FunControlToVideo) and VACE by slicing /
+    rescaling c_concat, denoise_mask, reference_latent, and vace_context.
+    Temporal frames are never split (spatial-only), so causal temporal attention
+    is never broken.
     """
 
     @classmethod
@@ -251,9 +415,28 @@ class WanTiledSampler:
                 }),
             },
             "optional": {
+                "scale_schedule": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Multiscale (coarse-to-fine) schedule mapping step → resolution %. "
+                               "e.g. {0:25, 10:50, 20:100} runs the WHOLE frame downscaled to 25% "
+                               "for steps 0–9, 50% for 10–19, then full-res from 20. Values are "
+                               "held until the next key. While scale < 100% the frame is evaluated "
+                               "in a single pass (tiling is skipped) so global motion stays coherent "
+                               "— the key fix for I2V drift. Empty = always 100%.",
+                }),
+                "tile_schedule": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Per-step tiling bypass schedule (1 = whole-frame / no tiling, "
+                               "0 = tile). e.g. {0:1, 20:0} runs whole-frame for steps 0–19 then "
+                               "tiles from 20. Held until the next key. Empty = use the "
+                               "bypass_tiling toggle for every step. Ignored while scale < 100%.",
+                }),
                 "bypass_tiling": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Skip tiling entirely — equivalent to plain KSamplerAdvanced.",
+                    "tooltip": "Skip tiling entirely — equivalent to plain KSamplerAdvanced "
+                               "(unless a scale_schedule / tile_schedule is set).",
                 }),
                 "reference_latent_full": ("BOOLEAN", {
                     "default": True,
@@ -265,8 +448,8 @@ class WanTiledSampler:
                 }),
                 "debug": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Print tile layout, blend weight sanity check, and "
-                               "per-step conditioning slice info.",
+                    "tooltip": "Print tile layout, blend weight sanity check, per-step "
+                               "scale/tile decisions, and conditioning slice info.",
                 }),
             },
         }
@@ -294,6 +477,8 @@ class WanTiledSampler:
         tiles_w,
         overlap_h,
         overlap_w,
+        scale_schedule="",
+        tile_schedule="",
         bypass_tiling=False,
         reference_latent_full=True,
         debug=False,
@@ -302,8 +487,14 @@ class WanTiledSampler:
         force_full_denoise = return_with_leftover_noise != "enable"
         disable_noise      = add_noise == "disable"
 
-        # --- bypass: plain KSamplerAdvanced behaviour ---
-        if bypass_tiling or (tiles_h <= 1 and tiles_w <= 1):
+        scale_sched = _parse_schedule(scale_schedule)
+        tile_sched  = _parse_schedule(tile_schedule)
+        tiling_possible = tiles_h > 1 or tiles_w > 1
+
+        # Wrapper is needed if any scheduling is requested, or if plain tiling is
+        # active.  A bare bypass with no schedules → plain KSamplerAdvanced.
+        sched_active = scale_sched is not None or tile_sched is not None
+        if not sched_active and (bypass_tiling or not tiling_possible):
             return self._plain_sample(
                 model, noise_seed, steps, cfg, sampler_name, scheduler,
                 positive, negative, latent_image,
@@ -349,6 +540,10 @@ class WanTiledSampler:
                   f"overlap_w={overlap_w}% ({overlap_w_px}px)")
             print(f"  h_starts={h_starts} tile_h={tile_h}")
             print(f"  w_starts={w_starts} tile_w={tile_w} overlap_w_px={overlap_w_px}")
+            if scale_sched is not None:
+                print(f"  scale_schedule={scale_sched}")
+            if tile_sched is not None:
+                print(f"  tile_schedule={tile_sched}")
 
         tile_specs = []
         for hi, hs in enumerate(h_starts):
@@ -391,11 +586,26 @@ class WanTiledSampler:
             print(f"  blend weight sanity: min={mn:.4f} max={mx:.4f} "
                   f"({'OK' if abs(mn - 1.0) < 0.02 and abs(mx - 1.0) < 0.02 else 'WARN'})")
 
+        # --- precompute per-step starting sigmas for schedule lookups ---
+        start_sigmas = None
+        if sched_active:
+            start_sigmas = self._active_start_sigmas(
+                model, steps, sampler_name, scheduler, denoise,
+                start_at_step, end_at_step, force_full_denoise,
+            )
+
+        default_tile_on = tiling_possible and not bypass_tiling
+
         # --- install wrapper on model clone ---
         model_clone = model.clone()
         existing_wrapper = model_clone.model_options.get('model_function_wrapper', None)
-        tile_wrapper = _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=debug,
-                                              reference_latent_full=reference_latent_full)
+        tile_wrapper = _make_wan_tile_wrapper(
+            tile_specs, existing_wrapper, debug=debug,
+            reference_latent_full=reference_latent_full,
+            default_tile_on=default_tile_on,
+            scale_sched=scale_sched, tile_sched=tile_sched,
+            start_sigmas=start_sigmas,
+        )
         model_clone.model_options['model_function_wrapper'] = tile_wrapper
 
         return self._plain_sample(
@@ -405,6 +615,35 @@ class WanTiledSampler:
             start_step=start_at_step, last_step=end_at_step,
             force_full_denoise=force_full_denoise,
         )
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _active_start_sigmas(model, steps, sampler_name, scheduler, denoise,
+                             start_step, last_step, force_full_denoise):
+        """
+        Reproduce the sigma schedule comfy.sample.sample will use (including the
+        start/last-step slicing) and return the per-step *starting* sigmas as a
+        plain float list, so the wrapper can map an incoming sigma → step index.
+        """
+        try:
+            ks = comfy.samplers.KSampler(
+                model, steps=steps, device=model.load_device,
+                sampler=sampler_name, scheduler=scheduler,
+                denoise=denoise, model_options=model.model_options,
+            )
+            sigmas = ks.sigmas
+            if last_step is not None and last_step < (len(sigmas) - 1):
+                sigmas = sigmas[:last_step + 1]
+                if force_full_denoise:
+                    sigmas = sigmas.clone()
+                    sigmas[-1] = 0
+            if start_step is not None and start_step < (len(sigmas) - 1):
+                sigmas = sigmas[start_step:]
+            # per-step starting sigmas = all but the final (target) sigma
+            return [float(x) for x in sigmas[:-1]]
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
 
