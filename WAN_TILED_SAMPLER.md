@@ -148,11 +148,21 @@ overrides the `bypass_tiling` toggle at full resolution.
 
 ComfyUI calls the wrapper with the current **sigma** as `timestep`
 (`sampling_function(..., timestep=sigma)` in `comfy/samplers.py`), not a step
-index.  The node reproduces the exact sigma schedule
-(`KSampler(...).sigmas` plus the same `start_step`/`last_step` slicing as
-`KSampler.sample`) and maps each incoming sigma to the nearest per-step starting
-sigma.  This is robust to samplers that evaluate the model more than once per
-step — intermediate sigmas snap to the closest scheduled step.
+index.  The full per-pass sigma schedule is also handed to every model call as
+`transformer_options["sample_sigmas"]` (set in `CFGGuider.inner_sample`), so the
+wrapper maps the incoming sigma to the nearest entry of that schedule to recover
+a 0-based step index — local to the current sampler pass, and robust to samplers
+that evaluate the model more than once per step (intermediate sigmas snap to the
+closest scheduled step).
+
+Because `sample_sigmas` is read at call time, the wrapper needs no knowledge of
+the sampler's `steps` / `scheduler` / `start_step` / `denoise`.  That is what
+lets the same wrapper power both the all-in-one **sampler** node and the
+**model-patch** node (`MODEL → MODEL`, Kohya-Deep-Shrink style), and what makes a
+WAN 2.2 high/low-noise two-sampler split get correct per-pass step indices for
+free.  Tile geometry, which depends on the latent's H×W, is likewise resolved
+lazily on the first model call and cached per resolution, since the patch node
+doesn't see the latent ahead of time.
 
 ## References
 

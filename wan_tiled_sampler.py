@@ -123,13 +123,77 @@ def _nearest_step(start_sigmas, sigma):
     return best_i
 
 
+def _build_tile_specs(H, W, tiles_h, tiles_w, overlap_h, overlap_w, debug=False):
+    """Build the per-tile bounds + trapezoidal blend windows for a latent of
+    spatial size (H, W).  Pure geometry — no model state — so it can be computed
+    lazily on the first model call (the patch node doesn't know the latent size
+    ahead of time) and cached per resolution."""
+    # Convert overlap % → latent pixels based on tile size.  Tile size isn't known
+    # yet, so approximate from total / n_tiles, then recompute with the real size.
+    def _pct_to_px(total, n_tiles, pct):
+        if n_tiles <= 1 or pct == 0:
+            return 0
+        approx_tile = math.ceil(total / n_tiles)
+        return max(0, round(approx_tile * pct / 100))
+
+    overlap_h_px = _pct_to_px(H, tiles_h, overlap_h)
+    overlap_w_px = _pct_to_px(W, tiles_w, overlap_w)
+    h_starts, tile_h = _compute_tile_starts(H, tiles_h, overlap_h_px)
+    w_starts, tile_w = _compute_tile_starts(W, tiles_w, overlap_w_px)
+
+    overlap_h_px = max(0, round(tile_h * overlap_h / 100))
+    overlap_w_px = max(0, round(tile_w * overlap_w / 100))
+    h_starts, tile_h = _compute_tile_starts(H, tiles_h, overlap_h_px)
+    w_starts, tile_w = _compute_tile_starts(W, tiles_w, overlap_w_px)
+
+    if debug:
+        print(f"[WanTiled] latent H×W={H}×{W} tiles_h={tiles_h} tiles_w={tiles_w} "
+              f"overlap_h={overlap_h}% ({overlap_h_px}px) overlap_w={overlap_w}% ({overlap_w_px}px)")
+        print(f"  h_starts={h_starts} tile_h={tile_h}")
+        print(f"  w_starts={w_starts} tile_w={tile_w}")
+
+    tile_specs = []
+    for hi, hs in enumerate(h_starts):
+        he = min(hs + tile_h, H)
+        fade_left_h  = max(0, h_starts[hi - 1] + tile_h - hs) if hi > 0 else 0
+        fade_right_h = max(0, hs + tile_h - h_starts[hi + 1]) if hi < len(h_starts) - 1 else 0
+
+        for wi, ws in enumerate(w_starts):
+            we = min(ws + tile_w, W)
+            fade_left_w  = max(0, w_starts[wi - 1] + tile_w - ws) if wi > 0 else 0
+            fade_right_w = max(0, ws + tile_w - w_starts[wi + 1]) if wi < len(w_starts) - 1 else 0
+
+            win_h = _make_window_1d(he - hs, fade_left_h, fade_right_h, torch.float32, 'cpu')
+            win_w = _make_window_1d(we - ws, fade_left_w, fade_right_w, torch.float32, 'cpu')
+            # shape (1, 1, 1, Ht, Wt) — broadcast over (B, C, F)
+            window_2d = (win_h[:, None] * win_w[None, :]).reshape(1, 1, 1, he - hs, we - ws)
+
+            tile_specs.append({'h_start': hs, 'h_end': he,
+                               'w_start': ws, 'w_end': we,
+                               'window_2d': window_2d})
+            if debug:
+                print(f"  tile h:[{hs}:{he}] w:[{ws}:{we}] "
+                      f"fade_h=({fade_left_h},{fade_right_h}) fade_w=({fade_left_w},{fade_right_w})")
+
+    if debug:
+        w_test = torch.zeros(1, 1, 1, H, W, dtype=torch.float32)
+        for spec in tile_specs:
+            hs, he, ws, we = spec['h_start'], spec['h_end'], spec['w_start'], spec['w_end']
+            w_test[:, :, :, hs:he, ws:we] += spec['window_2d']
+        mn, mx = w_test.min().item(), w_test.max().item()
+        print(f"  blend weight sanity: min={mn:.4f} max={mx:.4f} "
+              f"({'OK' if abs(mn - 1.0) < 0.02 and abs(mx - 1.0) < 0.02 else 'WARN'})")
+
+    return tile_specs
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MultiDiffusion + multiscale wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False,
+def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
                            reference_latent_full=False, default_tile_on=True,
-                           scale_sched=None, tile_sched=None, start_sigmas=None):
+                           scale_sched=None, tile_sched=None):
     """
     Returns a model_function_wrapper implementing, per denoising step:
 
@@ -152,8 +216,16 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False,
     default_tile_on at scale == 100%.
     """
     sched_active = scale_sched is not None or tile_sched is not None
-    start_sigmas = start_sigmas or []
     last_logged = [-1]
+    specs_cache = {}
+
+    def _get_specs(H, W):
+        key = (H, W)
+        if key not in specs_cache:
+            specs_cache[key] = _build_tile_specs(
+                H, W, tiling_cfg["tiles_h"], tiling_cfg["tiles_w"],
+                tiling_cfg["overlap_h"], tiling_cfg["overlap_w"], debug=debug)
+        return specs_cache[key]
 
     def _call_model(model_fn, d):
         if existing_wrapper is not None:
@@ -195,7 +267,7 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False,
             pred = _resize_spatial(pred, H, W, "bilinear")
         return pred.to(x_full.dtype) if isinstance(pred, torch.Tensor) else pred
 
-    def _run_tiled(model_fn, input_dict):
+    def _run_tiled(model_fn, input_dict, tile_specs):
         x_full = input_dict["input"]
         B, C, F, H, W = x_full.shape
         dtype = x_full.dtype
@@ -305,14 +377,25 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False,
         return (accum / w_acc.clamp(min=1e-8)).to(dtype)
 
     def wrapper(model_fn, input_dict):
-        # Resolve the current step from the incoming sigma.
+        # Resolve the current step (0-based, local to this sampler pass) from the
+        # incoming sigma vs. the full per-pass sigma schedule, which ComfyUI hands
+        # to every model call in transformer_options["sample_sigmas"].  This makes
+        # the wrapper sampler-agnostic — it needs no knowledge of steps/scheduler —
+        # and gives correct local indices across a WAN 2.2 two-sampler split.
         step = 0
-        if sched_active and start_sigmas:
+        if sched_active:
             try:
+                to = input_dict.get("c", {}).get("transformer_options", {})
+                ss = to.get("sample_sigmas", None)
                 sigma = float(input_dict["timestep"].flatten()[0])
-                step = _nearest_step(start_sigmas, sigma)
+                if ss is not None and len(ss) > 1:
+                    step = _nearest_step([float(s) for s in ss[:-1]], sigma)
             except Exception:
                 step = 0
+
+        x_full = input_dict["input"]
+        H, W = x_full.shape[-2], x_full.shape[-1]
+        tile_specs = _get_specs(H, W)
 
         scale = 100.0 if scale_sched is None else max(1.0, min(100.0, _schedule_lookup(scale_sched, step)))
         if tile_sched is None:
@@ -326,19 +409,37 @@ def _make_wan_tile_wrapper(tile_specs, existing_wrapper, debug=False,
             last_logged[0] = step
             mode = ("downscale %d%% (whole-frame)" % round(scale)) if scale < 100 \
                 else ("tiled" if do_tile else "full")
-            print(f"[WanTiledSampler] step {step}: scale={round(scale)}% → {mode}")
+            print(f"[WanTiled] step {step}: scale={round(scale)}% → {mode}")
 
         if scale < 100:
             return _run_downscaled(model_fn, input_dict, scale)
         if do_tile:
-            return _run_tiled(model_fn, input_dict)
+            return _run_tiled(model_fn, input_dict, tile_specs)
         return _call_model(model_fn, input_dict)
 
     return wrapper
 
 
+def _patch_model(model, tiles_h, tiles_w, overlap_h, overlap_w,
+                 scale_sched=None, tile_sched=None, bypass_tiling=False,
+                 reference_latent_full=True, debug=False):
+    """Clone `model` and install the multiscale/tiling model_function_wrapper,
+    chaining any wrapper already present.  Shared by the sampler and patch nodes."""
+    tiling_cfg = {"tiles_h": tiles_h, "tiles_w": tiles_w,
+                  "overlap_h": overlap_h, "overlap_w": overlap_w}
+    default_tile_on = (tiles_h > 1 or tiles_w > 1) and not bypass_tiling
+    m = model.clone()
+    existing = m.model_options.get("model_function_wrapper", None)
+    m.model_options["model_function_wrapper"] = _make_wan_tile_wrapper(
+        tiling_cfg, existing, debug=debug,
+        reference_latent_full=reference_latent_full,
+        default_tile_on=default_tile_on,
+        scale_sched=scale_sched, tile_sched=tile_sched)
+    return m
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Node
+# Nodes
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WanTiledSampler:
@@ -503,110 +604,15 @@ class WanTiledSampler:
                 force_full_denoise=force_full_denoise,
             )
 
-        # --- build tile specs ---
-        latent = latent_image["samples"]
-        # latent may be 4D (image) or 5D (video)
-        if latent.dim() == 4:
-            B, C, H, W = latent.shape
-            F = 1
-        else:
-            B, C, F, H, W = latent.shape
-
-        # Convert overlap % → latent pixels based on tile size.
-        # Tile size isn't known yet so approximate from total size / n_tiles,
-        # then recompute after _compute_tile_starts with the real tile_h/tile_w.
-        def _pct_to_px(total, n_tiles, pct):
-            if n_tiles <= 1 or pct == 0:
-                return 0
-            approx_tile = math.ceil(total / n_tiles)
-            return max(0, round(approx_tile * pct / 100))
-
-        overlap_h_px = _pct_to_px(H, tiles_h, overlap_h)
-        overlap_w_px = _pct_to_px(W, tiles_w, overlap_w)
-
-        h_starts, tile_h = _compute_tile_starts(H, tiles_h, overlap_h_px)
-        w_starts, tile_w = _compute_tile_starts(W, tiles_w, overlap_w_px)
-
-        # Recompute with actual tile size for accuracy
-        overlap_h_px = max(0, round(tile_h * overlap_h / 100))
-        overlap_w_px = max(0, round(tile_w * overlap_w / 100))
-        h_starts, tile_h = _compute_tile_starts(H, tiles_h, overlap_h_px)
-        w_starts, tile_w = _compute_tile_starts(W, tiles_w, overlap_w_px)
-
-        if debug:
-            print(f"[WanTiledSampler] latent={tuple(latent.shape)} "
-                  f"tiles_h={tiles_h} tiles_w={tiles_w} "
-                  f"overlap_h={overlap_h}% ({overlap_h_px}px) "
-                  f"overlap_w={overlap_w}% ({overlap_w_px}px)")
-            print(f"  h_starts={h_starts} tile_h={tile_h}")
-            print(f"  w_starts={w_starts} tile_w={tile_w} overlap_w_px={overlap_w_px}")
-            if scale_sched is not None:
-                print(f"  scale_schedule={scale_sched}")
-            if tile_sched is not None:
-                print(f"  tile_schedule={tile_sched}")
-
-        tile_specs = []
-        for hi, hs in enumerate(h_starts):
-            he = min(hs + tile_h, H)
-            fade_left_h  = max(0, h_starts[hi - 1] + tile_h - hs) if hi > 0 else 0
-            fade_right_h = max(0, hs + tile_h - h_starts[hi + 1]) if hi < len(h_starts) - 1 else 0
-
-            for wi, ws in enumerate(w_starts):
-                we = min(ws + tile_w, W)
-                fade_left_w  = max(0, w_starts[wi - 1] + tile_w - ws) if wi > 0 else 0
-                fade_right_w = max(0, ws + tile_w - w_starts[wi + 1]) if wi < len(w_starts) - 1 else 0
-
-                win_h = _make_window_1d(he - hs, fade_left_h, fade_right_h,
-                                        torch.float32, 'cpu')
-                win_w = _make_window_1d(we - ws, fade_left_w, fade_right_w,
-                                        torch.float32, 'cpu')
-                # shape (1, 1, 1, Ht, Wt) — broadcast over (B, C, F)
-                window_2d = (win_h[:, None] * win_w[None, :]).reshape(1, 1, 1, he - hs, we - ws)
-
-                tile_specs.append({
-                    'h_start': hs, 'h_end': he,
-                    'w_start': ws, 'w_end': we,
-                    'window_2d': window_2d,
-                })
-
-                if debug:
-                    print(f"  tile h:[{hs}:{he}] w:[{ws}:{we}] "
-                          f"fade_h=({fade_left_h},{fade_right_h}) "
-                          f"fade_w=({fade_left_w},{fade_right_w})")
-
-        # blend weight sanity check
-        if debug:
-            w_test = torch.zeros(1, 1, 1, H, W, dtype=torch.float32)
-            for spec in tile_specs:
-                hs, he = spec['h_start'], spec['h_end']
-                ws, we = spec['w_start'], spec['w_end']
-                w_test[:, :, :, hs:he, ws:we] += spec['window_2d']
-            mn = w_test.min().item()
-            mx = w_test.max().item()
-            print(f"  blend weight sanity: min={mn:.4f} max={mx:.4f} "
-                  f"({'OK' if abs(mn - 1.0) < 0.02 and abs(mx - 1.0) < 0.02 else 'WARN'})")
-
-        # --- precompute per-step starting sigmas for schedule lookups ---
-        start_sigmas = None
-        if sched_active:
-            start_sigmas = self._active_start_sigmas(
-                model, steps, sampler_name, scheduler, denoise,
-                start_at_step, end_at_step, force_full_denoise,
-            )
-
-        default_tile_on = tiling_possible and not bypass_tiling
-
-        # --- install wrapper on model clone ---
-        model_clone = model.clone()
-        existing_wrapper = model_clone.model_options.get('model_function_wrapper', None)
-        tile_wrapper = _make_wan_tile_wrapper(
-            tile_specs, existing_wrapper, debug=debug,
-            reference_latent_full=reference_latent_full,
-            default_tile_on=default_tile_on,
+        # --- install the multiscale/tiling wrapper on a model clone ---
+        # Tile geometry and per-step sigma mapping are resolved lazily inside the
+        # wrapper (from the latent size and transformer_options["sample_sigmas"]).
+        model_clone = _patch_model(
+            model, tiles_h, tiles_w, overlap_h, overlap_w,
             scale_sched=scale_sched, tile_sched=tile_sched,
-            start_sigmas=start_sigmas,
+            bypass_tiling=bypass_tiling,
+            reference_latent_full=reference_latent_full, debug=debug,
         )
-        model_clone.model_options['model_function_wrapper'] = tile_wrapper
 
         return self._plain_sample(
             model_clone, noise_seed, steps, cfg, sampler_name, scheduler,
@@ -615,35 +621,6 @@ class WanTiledSampler:
             start_step=start_at_step, last_step=end_at_step,
             force_full_denoise=force_full_denoise,
         )
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _active_start_sigmas(model, steps, sampler_name, scheduler, denoise,
-                             start_step, last_step, force_full_denoise):
-        """
-        Reproduce the sigma schedule comfy.sample.sample will use (including the
-        start/last-step slicing) and return the per-step *starting* sigmas as a
-        plain float list, so the wrapper can map an incoming sigma → step index.
-        """
-        try:
-            ks = comfy.samplers.KSampler(
-                model, steps=steps, device=model.load_device,
-                sampler=sampler_name, scheduler=scheduler,
-                denoise=denoise, model_options=model.model_options,
-            )
-            sigmas = ks.sigmas
-            if last_step is not None and last_step < (len(sigmas) - 1):
-                sigmas = sigmas[:last_step + 1]
-                if force_full_denoise:
-                    sigmas = sigmas.clone()
-                    sigmas[-1] = 0
-            if start_step is not None and start_step < (len(sigmas) - 1):
-                sigmas = sigmas[start_step:]
-            # per-step starting sigmas = all but the final (target) sigma
-            return [float(x) for x in sigmas[:-1]]
-        except Exception:
-            return None
 
     # ------------------------------------------------------------------
 
@@ -687,14 +664,107 @@ class WanTiledSampler:
         return (out,)
 
 
+class WanTiledSamplerPatch:
+    """
+    Model patch (MODEL → MODEL) that installs the same per-step MultiDiffusion
+    tiling + multiscale scheduling as WanTiledSampler, but as a wrapper on the
+    model — so it works with any vanilla sampler (KSampler, KSamplerAdvanced,
+    SamplerCustom…).  Plug the patched MODEL into your sampler of choice.
+
+    Unlike the all-in-one node, the schedule's step indices are resolved at
+    sample time from transformer_options["sample_sigmas"], so no sampler settings
+    need to be known here, and a WAN 2.2 two-sampler (high/low-noise) split gets
+    correct per-pass local step indices automatically.
+
+    Apply this patch LAST in any chain of model patches: tiling needs the
+    model_function_wrapper slot.  An existing wrapper is chained, but a later
+    patch that overwrites the slot without chaining would drop this one.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "tiles_h": ("INT", {
+                    "default": 2, "min": 1, "max": 8, "step": 1,
+                    "tooltip": "Number of spatial tiles along the height axis. Set 1 to disable.",
+                }),
+                "tiles_w": ("INT", {
+                    "default": 2, "min": 1, "max": 8, "step": 1,
+                    "tooltip": "Number of spatial tiles along the width axis. Set 1 to disable.",
+                }),
+                "overlap_h": ("INT", {
+                    "default": 25, "min": 0, "max": 50, "step": 1,
+                    "tooltip": "Overlap between height tiles, % of tile height (0–50%).",
+                }),
+                "overlap_w": ("INT", {
+                    "default": 25, "min": 0, "max": 50, "step": 1,
+                    "tooltip": "Overlap between width tiles, % of tile width (0–50%).",
+                }),
+            },
+            "optional": {
+                "scale_schedule": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Multiscale (coarse-to-fine) schedule, step → resolution %. "
+                               "e.g. {0:25, 10:50, 20:100} runs the WHOLE frame downscaled to "
+                               "25% for steps 0–9, 50% for 10–19, then full-res from 20 (held "
+                               "until next key). While scale < 100% the frame runs in one pass "
+                               "(no tiling) so global motion stays coherent — the I2V fix. "
+                               "Step indices are local to each sampler pass. Empty = always 100%.",
+                }),
+                "tile_schedule": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Per-step tiling bypass (1 = whole-frame, 0 = tile). "
+                               "Empty = use bypass_tiling. Ignored while scale < 100%.",
+                }),
+                "bypass_tiling": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Skip tiling (unless a scale_schedule / tile_schedule is set).",
+                }),
+                "reference_latent_full": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Pass the full reference frame to every tile (I2V global context) "
+                               "instead of cropping it to the tile region. Keep on for I2V.",
+                }),
+                "debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print tile layout, blend-weight sanity check, and per-step "
+                               "scale/tile decisions to the console.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "Mago Nodes/Sampling"
+
+    def patch(self, model, tiles_h, tiles_w, overlap_h, overlap_w,
+              scale_schedule="", tile_schedule="", bypass_tiling=False,
+              reference_latent_full=True, debug=False):
+        scale_sched = _parse_schedule(scale_schedule)
+        tile_sched  = _parse_schedule(tile_schedule)
+        m = _patch_model(
+            model, tiles_h, tiles_w, overlap_h, overlap_w,
+            scale_sched=scale_sched, tile_sched=tile_sched,
+            bypass_tiling=bypass_tiling,
+            reference_latent_full=reference_latent_full, debug=debug,
+        )
+        return (m,)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ComfyUI registration
 # ─────────────────────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
     "WanTiledSampler": WanTiledSampler,
+    "WanTiledSamplerPatch": WanTiledSamplerPatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanTiledSampler": "WAN Tiled Sampler",
+    "WanTiledSamplerPatch": "WAN Tiled Sampler (Model Patch)",
 }

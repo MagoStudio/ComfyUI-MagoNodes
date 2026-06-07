@@ -1,6 +1,7 @@
 # ComfyUI-MagoNodes
 
-MagoStudio nodes for ComfyUI. Currently a single node: **WAN Tiled Sampler**.
+MagoStudio nodes for ComfyUI. Currently the **WAN Tiled Sampler** — available as
+an all-in-one sampler node and as a model-patch node.
 
 ## WAN Tiled Sampler
 
@@ -55,9 +56,22 @@ There are no extra dependencies.
 
 ### Usage
 
-Find the node under **Mago Nodes / Sampling → WAN Tiled Sampler**. Use it exactly
-like `KSamplerAdvanced` — same inputs (model, conditioning, latent, sampler,
-scheduler, steps, cfg, seed, start/end step) — plus the tiling controls below.
+The pack ships **two nodes**, both under **Mago Nodes / Sampling**, that do the
+same thing in different shapes — pick one:
+
+- **WAN Tiled Sampler** — an all-in-one sampler. Use it exactly like
+  `KSamplerAdvanced` (same inputs: model, conditioning, latent, sampler,
+  scheduler, steps, cfg, seed, start/end step) plus the tiling/scale controls.
+- **WAN Tiled Sampler (Model Patch)** — a `MODEL → MODEL` patch (Kohya
+  Deep-Shrink style). Drop it between your model and **any** vanilla sampler
+  (`KSampler`, `KSamplerAdvanced`, `SamplerCustom`…). Same tiling/scale controls,
+  no sampler settings. **Apply it last** in a chain of model patches — it needs
+  the `model_function_wrapper` slot (an existing wrapper is chained, but a later
+  patch that overwrites the slot would drop it). This is the better fit for the
+  WAN 2.2 two-sampler split: patch each model and the per-pass step indices are
+  resolved automatically.
+
+The tiling/scale controls are identical for both nodes:
 
 | Input | Default | Description |
 |-------|---------|-------------|
