@@ -110,7 +110,7 @@ So feeding a **downscaled whole-frame latent** into a single model call:
 - gives the model the *entire* frame as context, so motion is decided once,
   coherently, instead of per tile.
 
-### Two schedules
+### The schedule
 
 `scale_schedule` maps step → resolution %, held until the next key:
 `{0:25, 10:50, 20:100}`.  While the scheduled scale is < 100% the wrapper
@@ -141,8 +141,10 @@ level still matches sigma, for both flow- and eps-parameterised models.  The
 signal, not noise, so they use antialiased `area`; `denoise_mask` uses
 `nearest-exact` to keep its values crisp.
 
-`tile_schedule` maps step → bypass flag (`1` = whole-frame, `0` = tile) and
-overrides the `bypass_tiling` toggle at full resolution.
+At full resolution (scale == 100%) tiling follows the `bypass_tiling` toggle.
+The schedule alone therefore expresses the whole coarse-to-fine plan — there is
+no separate per-step tiling schedule, since downscaled steps never tile and
+full-res steps always do (unless tiling is bypassed outright).
 
 ### Mapping a model call to a step
 

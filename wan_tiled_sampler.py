@@ -193,7 +193,7 @@ def _build_tile_specs(H, W, tiles_h, tiles_w, overlap_h, overlap_w, debug=False)
 
 def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
                            reference_latent_full=False, default_tile_on=True,
-                           scale_sched=None, tile_sched=None):
+                           scale_sched=None):
     """
     Returns a model_function_wrapper implementing, per denoising step:
 
@@ -212,10 +212,9 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
 
     Tiling is skipped while scale < 100% (tiling a downscaled latent defeats the
     purpose); the natural pairing is low-res whole-frame early → full-res tiled
-    late.  tile_sched (1 = bypass / whole-frame, 0 = tile) overrides
-    default_tile_on at scale == 100%.
+    late.  At scale == 100% tiling follows default_tile_on (i.e. bypass_tiling).
     """
-    sched_active = scale_sched is not None or tile_sched is not None
+    sched_active = scale_sched is not None
     last_logged = [-1]
     specs_cache = {}
 
@@ -398,12 +397,7 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
         tile_specs = _get_specs(H, W)
 
         scale = 100.0 if scale_sched is None else max(1.0, min(100.0, _schedule_lookup(scale_sched, step)))
-        if tile_sched is None:
-            tile_on = default_tile_on
-        else:
-            tile_on = _schedule_lookup(tile_sched, step) < 0.5  # 0 = tile, 1 = bypass
-
-        do_tile = tile_on and len(tile_specs) > 1
+        do_tile = default_tile_on and len(tile_specs) > 1
 
         if debug and step != last_logged[0]:
             last_logged[0] = step
@@ -421,7 +415,7 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
 
 
 def _patch_model(model, tiles_h, tiles_w, overlap_h, overlap_w,
-                 scale_sched=None, tile_sched=None, bypass_tiling=False,
+                 scale_sched=None, bypass_tiling=False,
                  reference_latent_full=True, debug=False):
     """Clone `model` and install the multiscale/tiling model_function_wrapper,
     chaining any wrapper already present.  Shared by the sampler and patch nodes."""
@@ -434,7 +428,7 @@ def _patch_model(model, tiles_h, tiles_w, overlap_h, overlap_w,
         tiling_cfg, existing, debug=debug,
         reference_latent_full=reference_latent_full,
         default_tile_on=default_tile_on,
-        scale_sched=scale_sched, tile_sched=tile_sched)
+        scale_sched=scale_sched)
     return m
 
 
@@ -526,18 +520,10 @@ class WanTiledSampler:
                                "in a single pass (tiling is skipped) so global motion stays coherent "
                                "— the key fix for I2V drift. Empty = always 100%.",
                 }),
-                "tile_schedule": ("STRING", {
-                    "default": "",
-                    "multiline": False,
-                    "tooltip": "Per-step tiling bypass schedule (1 = whole-frame / no tiling, "
-                               "0 = tile). e.g. {0:1, 20:0} runs whole-frame for steps 0–19 then "
-                               "tiles from 20. Held until the next key. Empty = use the "
-                               "bypass_tiling toggle for every step. Ignored while scale < 100%.",
-                }),
                 "bypass_tiling": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Skip tiling entirely — equivalent to plain KSamplerAdvanced "
-                               "(unless a scale_schedule / tile_schedule is set).",
+                               "(unless a scale_schedule is set).",
                 }),
                 "reference_latent_full": ("BOOLEAN", {
                     "default": True,
@@ -579,7 +565,6 @@ class WanTiledSampler:
         overlap_h,
         overlap_w,
         scale_schedule="",
-        tile_schedule="",
         bypass_tiling=False,
         reference_latent_full=True,
         debug=False,
@@ -589,12 +574,11 @@ class WanTiledSampler:
         disable_noise      = add_noise == "disable"
 
         scale_sched = _parse_schedule(scale_schedule)
-        tile_sched  = _parse_schedule(tile_schedule)
         tiling_possible = tiles_h > 1 or tiles_w > 1
 
-        # Wrapper is needed if any scheduling is requested, or if plain tiling is
-        # active.  A bare bypass with no schedules → plain KSamplerAdvanced.
-        sched_active = scale_sched is not None or tile_sched is not None
+        # Wrapper is needed if a scale_schedule is requested, or if plain tiling is
+        # active.  A bare bypass with no schedule → plain KSamplerAdvanced.
+        sched_active = scale_sched is not None
         if not sched_active and (bypass_tiling or not tiling_possible):
             return self._plain_sample(
                 model, noise_seed, steps, cfg, sampler_name, scheduler,
@@ -609,8 +593,7 @@ class WanTiledSampler:
         # wrapper (from the latent size and transformer_options["sample_sigmas"]).
         model_clone = _patch_model(
             model, tiles_h, tiles_w, overlap_h, overlap_w,
-            scale_sched=scale_sched, tile_sched=tile_sched,
-            bypass_tiling=bypass_tiling,
+            scale_sched=scale_sched, bypass_tiling=bypass_tiling,
             reference_latent_full=reference_latent_full, debug=debug,
         )
 
@@ -714,15 +697,9 @@ class WanTiledSamplerPatch:
                                "(no tiling) so global motion stays coherent — the I2V fix. "
                                "Step indices are local to each sampler pass. Empty = always 100%.",
                 }),
-                "tile_schedule": ("STRING", {
-                    "default": "",
-                    "multiline": False,
-                    "tooltip": "Per-step tiling bypass (1 = whole-frame, 0 = tile). "
-                               "Empty = use bypass_tiling. Ignored while scale < 100%.",
-                }),
                 "bypass_tiling": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Skip tiling (unless a scale_schedule / tile_schedule is set).",
+                    "tooltip": "Skip tiling (unless a scale_schedule is set).",
                 }),
                 "reference_latent_full": ("BOOLEAN", {
                     "default": True,
@@ -742,14 +719,12 @@ class WanTiledSamplerPatch:
     CATEGORY = "Mago Nodes/Sampling"
 
     def patch(self, model, tiles_h, tiles_w, overlap_h, overlap_w,
-              scale_schedule="", tile_schedule="", bypass_tiling=False,
+              scale_schedule="", bypass_tiling=False,
               reference_latent_full=True, debug=False):
         scale_sched = _parse_schedule(scale_schedule)
-        tile_sched  = _parse_schedule(tile_schedule)
         m = _patch_model(
             model, tiles_h, tiles_w, overlap_h, overlap_w,
-            scale_sched=scale_sched, tile_sched=tile_sched,
-            bypass_tiling=bypass_tiling,
+            scale_sched=scale_sched, bypass_tiling=bypass_tiling,
             reference_latent_full=reference_latent_full, debug=debug,
         )
         return (m,)

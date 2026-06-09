@@ -80,8 +80,7 @@ The tiling/scale controls are identical for both nodes:
 | `overlap_h` | 25 | Overlap between height tiles, as a percentage of tile height (0–50%). |
 | `overlap_w` | 25 | Overlap between width tiles, as a percentage of tile width (0–50%). |
 | `scale_schedule` | `""` | Multiscale schedule, step → resolution % (see below). Empty = always full-res. |
-| `tile_schedule` | `""` | Per-step tiling toggle, step → bypass flag (`1` = whole-frame, `0` = tile). Empty = use `bypass_tiling`. |
-| `bypass_tiling` | False | Skip tiling entirely — behaves like a plain `KSamplerAdvanced` (unless a schedule is set). |
+| `bypass_tiling` | False | Skip tiling entirely — behaves like a plain `KSamplerAdvanced` (unless a `scale_schedule` is set). |
 | `reference_latent_full` | True | Pass the full reference frame to every tile (I2V global context) instead of cropping it. Keep on for I2V. |
 | `debug` | False | Print tile layout, blend-weight sanity check, per-step scale/tile decisions, and slice info to the console. |
 
@@ -93,12 +92,9 @@ Overlap is a percentage so it stays resolution-independent. Guidance:
 
 ### Multiscale scheduling
 
-Both schedules are written as `{step: value, ...}` (commas optional, whitespace
-ignored). Each value is **held until the next key**, and step `0` is the first
-sampled step.
-
-`scale_schedule` sets the resolution per step as a percentage of the latent's
-native size:
+`scale_schedule` is written as `{step: value, ...}` (commas optional, whitespace
+ignored). Each value is **held until the next key**, step `0` is the first
+sampled step, and the value is a percentage of the latent's native size:
 
 ```
 {0:25, 10:50, 20:100}
@@ -107,31 +103,20 @@ native size:
 > Steps 0–9 run the whole frame at 25%, steps 10–19 at 50%, then 20→end at full
 > resolution. While scale < 100% the frame is evaluated in **one whole-frame
 > pass** (tiling is skipped, so global motion stays coherent); at 100% the node
-> tiles for detail.
+> tiles for detail. So the schedule alone drives the coarse-to-fine handoff —
+> low-res whole-frame early, full-res tiled late.
 
-`tile_schedule` independently controls whether each full-res step tiles
-(`0`) or runs whole-frame (`1`):
-
-```
-{0:1, 20:0}
-```
-
-> Whole-frame for steps 0–19, tiled from 20. (Redundant with `scale_schedule`
-> while scale < 100%, since low-res steps never tile.)
-
-**Recommended I2V recipe** — pair a coarse-to-fine scale ramp with tiling only at
-the end:
+**Recommended I2V recipe** — a gentle coarse-to-fine ramp:
 
 ```
 scale_schedule = {0:50, 15:100}
-tile_schedule  = {0:1, 15:0}
 ```
 
 ### Tips
 
-- Leave both schedules empty for the original behaviour: pure full-res tiling.
+- Leave `scale_schedule` empty for the original behaviour: pure full-res tiling.
 - Setting both `tiles_h` and `tiles_w` to `1` (or enabling `bypass_tiling`) with
-  no schedules makes the node identical to `KSamplerAdvanced`.
+  no schedule makes the node identical to `KSamplerAdvanced`.
 - More tiles = lower per-tile token count and memory, but more model evaluations
   per step. Start with 2×2 and increase only if you still see drift or run out of
   VRAM.
