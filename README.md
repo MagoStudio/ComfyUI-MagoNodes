@@ -1,7 +1,11 @@
 # ComfyUI-MagoNodes
 
-MagoStudio nodes for ComfyUI. Currently the **WAN Tiled Sampler** — available as
-an all-in-one sampler node and as a model-patch node.
+MagoStudio nodes for ComfyUI:
+
+- **WAN Tiled Sampler** — per-step MultiDiffusion tiling + multiscale scheduling
+  for WAN 2.1 / 2.2 (all-in-one sampler node and a model-patch node).
+- **LTX Tiled Sampler (Model Patch)** — per-step MultiDiffusion T×H×W tiling for
+  LTX-Video, as a model patch for the vanilla `SamplerCustomAdvanced`.
 
 ## WAN Tiled Sampler
 
@@ -128,6 +132,53 @@ scale_schedule = {0:50, 15:100}
   downscaling lives inside each model eval and never persists — so a second pass
   starting at `{0:100}` just runs full-res.
 - WAN distilled models typically use `cfg = 1`.
+
+## LTX Tiled Sampler (Model Patch)
+
+A `MODEL → MODEL` patch that adds per-step MultiDiffusion tiling along the
+temporal (T), height (H), and width (W) axes to an LTX-Video model. It works with
+the vanilla **`SamplerCustomAdvanced`** — no custom sampler needed.
+
+### Wiring
+
+Insert it on the model line, **after** your LoRA / ICLoRA loaders and **before**
+the guider:
+
+```
+… → LTX ICLoRA Loader → LTX Tiled Sampler (Model Patch) → CFGGuider → SamplerCustomAdvanced
+```
+
+The guide conditioning (`keyframe_idxs` / `guide_attention_entries`) and
+`denoise_mask` are cropped to each tile automatically, so ICLoRA / guide
+workflows keep working. Apply this patch **last** in any chain of model patches —
+it claims the `model_function_wrapper` slot (an existing wrapper is chained, but a
+later patch that overwrites the slot would drop it).
+
+### Inputs
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `tiles_h` | 2 | Tiles along height. `1` disables. (Official LTX Stage-2: 2.) |
+| `tiles_w` | 2 | Tiles along width. `1` disables. (Official LTX Stage-2: 2.) |
+| `overlap_h` | 6 | Overlap in latent units between H tiles (≈48 px at 8× VAE). |
+| `overlap_w` | 6 | Overlap in latent units between W tiles. |
+| `tiles_t` | 1 | Tiles along frames. `1` disables (recommended for most clips). |
+| `overlap_t` | 8 | Overlap in latent frames between temporal tiles. |
+| `bypass_tiling` | False | Return the model unpatched (single-pass). |
+| `debug` | False | Print tile layout, blend-weight check, and per-tile guide info. |
+
+Tiling is **per-step MultiDiffusion** — predictions are blended at every sigma
+step so all tiles stay on one trajectory (no temporal ghosting from independent
+per-tile schedules).
+
+**Credits.** The trapezoidal blend window, the Stage-2 tiling geometry (2×2
+spatial, 1 temporal), and the default overlaps follow the official Lightricks
+LTX-Video implementation (`ltx_core/tiling.py`), as do the causal-VAE coordinate
+conventions (temporal scale 8, spatial scale 32). The per-tile guide handling
+(`keyframe_idxs` / `guide_attention_entries`) is based on the
+[10S Nodes](https://github.com/TenStrip/10S-Comfy-nodes) LTX tiled sampler, with
+the coordinate / grid-mask logic reworked to fix correctness bugs in that
+implementation.
 
 ## References
 
