@@ -6,6 +6,8 @@ MagoStudio nodes for ComfyUI:
   for WAN 2.1 / 2.2 (all-in-one sampler node and a model-patch node).
 - **LTX Tiled Sampler (Model Patch)** — per-step MultiDiffusion T×H×W tiling for
   LTX-Video, as a model patch for the vanilla `SamplerCustomAdvanced`.
+- **Save / Load Conditioning** — cache text-encoder output to disk so a
+  fixed-prompt workflow can skip loading the text encoder.
 
 ## WAN Tiled Sampler
 
@@ -179,6 +181,44 @@ conventions (temporal scale 8, spatial scale 32). The per-tile guide handling
 [10S Nodes](https://github.com/TenStrip/10S-Comfy-nodes) LTX tiled sampler, with
 the coordinate / grid-mask logic reworked to fix correctness bugs in that
 implementation.
+
+## Save / Load Conditioning
+
+Two nodes (under **Mago Nodes/Conditioning**) that cache a `CONDITIONING` to disk
+and reload it. When your prompt is **fixed** (e.g. an LTX HDR-conversion prompt
+that never changes), bake the text-encoder output once, then run a production
+graph with the text-encoder nodes deleted — so the (often very large) text
+encoder never loads into VRAM. Only the diffusion model and VAE need to.
+
+- **Save Conditioning (Mago)** — `conditioning` + `filename` → saves to
+  `output/conditioning/<filename>.pth` and passes the conditioning through
+  (tensors are moved to CPU so the file is portable). Can sit inline or as a
+  terminal node.
+- **Load Conditioning (Mago)** — pick a saved `.pth` from the dropdown → outputs
+  `CONDITIONING`. Hit the node-list refresh after the first save.
+
+### Bake once
+
+```
+CLIPTextEncode (positive) → Save Conditioning   (filename: hdr_pos)
+CLIPTextEncode (negative) → Save Conditioning   (filename: hdr_neg)
+```
+
+### Production graph (text encoder deleted)
+
+```
+Load Conditioning (hdr_pos) ┐
+Load Conditioning (hdr_neg) ┴→ LTXVConditioning → LTXAddVideoICLoRAGuide (+ image + VAE) → CFGGuider → SamplerCustomAdvanced
+```
+
+Cache the encoder output **before** any per-input node (e.g.
+`LTXAddVideoICLoRAGuide`, which injects image-dependent guide tokens that change
+every run). `LTXVConditioning` only stamps `frame_rate` metadata (no model), so
+keep it in the production graph — or move the save to after it if you'd rather
+drop it too. The nodes are prompt/model-agnostic: they cache any `CONDITIONING`.
+
+> Note: `Load Conditioning` uses `torch.load(..., weights_only=False)` because
+> conditioning dicts hold non-tensor metadata — load only your own cache files.
 
 ## References
 
