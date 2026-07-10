@@ -309,14 +309,29 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
 
             # --- reference_latent: (B, C, H, W) → optionally slice spatial dims ---
             # When reference_latent_full=True the full reference frame is passed to every
-            # tile unchanged.  ref_conv appends its tokens to the sequence (no size
-            # constraint), so the full image provides global scene context to all tiles.
+            # tile.  On WAN builds whose ref_conv RoPEs the reference (t_len += 1 sized to
+            # the main latent's h/w), the full-res reference produces far more tokens than
+            # the RoPE table reserves → q/freqs sequence-length mismatch.  So for those
+            # models keep this False and crop the reference to the tile.
+            #
+            # Cropping alone isn't enough: WAN pads the MAIN latent to the patch size
+            # (circular) and reserves ceil(h/2)*ceil(w/2) RoPE slots for the reference
+            # frame, but ref_conv is a stride-2, UNPADDED conv that floors — so an odd tile
+            # dim drops a patch row/col and the reference comes up short (x < freqs by
+            # exactly the missing row/col).  Pad the cropped reference to an even H/W with
+            # the same circular padding WAN uses, so ref_conv yields the ceil token count.
             if not reference_latent_full:
                 rl = tile_c.get("reference_latent", None)
                 if rl is not None and isinstance(rl, torch.Tensor) and rl.dim() == 4:
                     try:
                         if rl.shape[-2] == H and rl.shape[-1] == W:
-                            tile_c["reference_latent"] = rl[:, :, hs:he, ws:we].contiguous()
+                            rl_tile = rl[:, :, hs:he, ws:we]
+                            ph = (2 - rl_tile.shape[-2] % 2) % 2  # pad H up to multiple of 2
+                            pw = (2 - rl_tile.shape[-1] % 2) % 2  # pad W up to multiple of 2
+                            if ph or pw:
+                                rl_tile = torch.nn.functional.pad(
+                                    rl_tile, (0, pw, 0, ph), mode="circular")
+                            tile_c["reference_latent"] = rl_tile.contiguous()
                     except Exception:
                         pass
 
