@@ -62,6 +62,8 @@ _WAN_PATCH_SIZE_SPATIAL = 2  # WAN spatial patch size (temporal is 1)
 # `debug` — each one means the node is silently doing less than asked.
 _WARNED = set()
 
+_UNSET = object()  # "no value yet", where None is itself a meaningful value
+
 
 def _warn_once(key, msg):
     """Print ``msg`` the first time ``key`` is seen in this process."""
@@ -176,13 +178,11 @@ def _build_even_tile_specs(H, W, tiles_h, tiles_w, overlap_h, overlap_w, debug=F
 
 def _vace_grid_mismatch(vace_data, H, W):
     """Describe the first vace context that is NOT a ``[Cv, F, H, W]`` tensor on the
-    latent grid, or ``None`` when every context in every entry is one — i.e. when
-    ``_slice_vace_tile`` / ``_resize_vace_downscale`` can handle the whole list.
+    latent grid, or ``None`` when every context in every entry is one.
 
     ``forward_vace`` sizes its hint tokens to the entry's ``seq_len``, which must
-    match the forward's own token count, so there is no per-entry escape: a context
-    left full-res is either silently truncated or a mid-run shape error.  Callers
-    bail to a full-frame forward instead."""
+    match the forward's token count, so there's no per-entry escape: a full-res
+    context is either truncated or a shape error.  Callers bail to a full frame."""
     for entry in vace_data:
         ctx_list = entry.get("context") if isinstance(entry, dict) else None
         if not isinstance(ctx_list, (list, tuple)) or len(ctx_list) == 0:
@@ -192,6 +192,22 @@ def _vace_grid_mismatch(vace_data, H, W):
                     and ctx.shape[-2] == H and ctx.shape[-1] == W):
                 return (str(tuple(ctx.shape)) if isinstance(ctx, torch.Tensor)
                         else type(ctx).__name__)
+    return None
+
+
+def _y_grid_mismatch(y, H, W):
+    """Describe ``y`` when it isn't a single ``[C, F, H, W]`` tensor on the latent
+    grid, or ``None`` when it is (or is absent).  The forward cats y onto x's channel
+    axis, so a full-res y against a tiled x raises from in here → callers bail."""
+    if y is None:
+        return None
+    if not (isinstance(y, (list, tuple)) and len(y) == 1):
+        n = len(y) if isinstance(y, (list, tuple)) else "?"
+        return f"{type(y).__name__} of {n}"
+    t = y[0]
+    if not (isinstance(t, torch.Tensor) and t.dim() == 4
+            and t.shape[-2] == H and t.shape[-1] == W):
+        return str(tuple(t.shape)) if isinstance(t, torch.Tensor) else type(t).__name__
     return None
 
 
@@ -269,7 +285,8 @@ def _run_downscaled_kj(orig, kwargs, scale, y, vace_data, vace_is_dict_list):
     Mirrors ``wan_tiled_sampler._run_downscaled`` but at kijai's transformer.forward
     contract (x=[z] 4D, seq_len recomputed, freqs bank reused unchanged).  Returns
     the forward's ``([pred], cache)`` tuple with the prediction at the original size,
-    or ``None`` if the target size isn't actually smaller (caller runs full-res)."""
+    a full-frame retry if the downscaled call's return can't be unpacked, or ``None``
+    if the target size isn't actually smaller (caller runs full-res)."""
     x = kwargs["x"]
     C, F, H, W = x[0].shape
     oh, ow = _round_even(H * scale / 100.0), _round_even(W * scale / 100.0)
@@ -307,11 +324,14 @@ def _run_downscaled_kj(orig, kwargs, scale, y, vace_data, vace_is_dict_list):
     if not (isinstance(out, (list, tuple)) and len(out) == 2
             and isinstance(out[0], (list, tuple)) and len(out[0]) == 1
             and isinstance(out[0][0], torch.Tensor)):
+        # Can't upscale what we can't unpack, and handing the sampler a reduced-res
+        # prediction corrupts its full-res latent → retry the whole frame, same
+        # fallback the tile loop takes on this failure.
         _warn_once("downscale_ret",
                    f"[WanKJTiled] downscaled forward returned {type(out).__name__}, not "
-                   f"([tensor], cache) — cannot upscale it back to ({H},{W}). The sampler "
-                   f"is receiving whatever the transformer returned, at reduced resolution.")
-        return out
+                   f"([tensor], cache) — retrying this step at full resolution. "
+                   f"Multiscale is INACTIVE.")
+        return orig(**kwargs)
     pred, cache = out
     # Always hand the sampler a full-resolution prediction so its latent state
     # stays full-res across the whole run (and any high/low-noise split).  Resize
@@ -320,7 +340,9 @@ def _run_downscaled_kj(orig, kwargs, scale, y, vace_data, vace_is_dict_list):
     # latent into the sampler's full-res update.  Mirrors wan_tiled_sampler's
     # _run_downscaled, which tests `!= (H, W)` for the same reason.
     if pred[0].shape[-2:] == (H, W):
-        return pred, cache
+        # Normalise dtype on this path too — autocast can return float32 while the
+        # sampler's latents are fp16/bf16.  `.to` is a no-op when they match.
+        return [pred[0].to(x[0].dtype)], cache
     if pred[0].shape[-2:] != (oh, ow):
         _warn_once("downscale_shape",
                    f"[WanKJTiled] downscaled pred shape {tuple(pred[0].shape)} is neither "
@@ -335,7 +357,9 @@ def _make_tiled_forward(transformer):
     per-call spatial MultiDiffusion, reading its live config from
     ``transformer._mago_tile_cfg`` and delegating to the original forward stored
     at ``transformer._mago_orig_forward``."""
-    warned = {"unsupported": False, "teacache": False}
+    # _UNSET, not None: an unknown step IS None, so None would read as "already
+    # logged" and the per-step line would never print on a build without current_step.
+    warned = {"unsupported": False, "teacache": False, "last_step_logged": _UNSET}
 
     def tiled_forward(*args, **kwargs):
         orig = transformer._mago_orig_forward
@@ -379,6 +403,17 @@ def _make_tiled_forward(transformer):
         vace_is_dict_list = (isinstance(vace_data, list) and len(vace_data) > 0
                              and isinstance(vace_data[0], dict))
 
+        # Other vace_data shapes (bare list of contexts, tensor) have no per-entry
+        # seq_len and read the forward's, which we rewrite → full-res ctx vs tile
+        # token count.  Full frame instead.
+        if vace_data is not None and not vace_is_dict_list:
+            _warn_once(f"vace_shape_{type(vace_data).__name__}",
+                       f"[WanKJTiled] vace_data is {type(vace_data).__name__}, not the "
+                       f"list-of-dicts form this node can slice → running every step "
+                       f"full-frame at full resolution. Tiling and multiscale are "
+                       f"INACTIVE for this run.")
+            return orig(*args, **kwargs)
+
         # A vace context off the latent grid can be neither sliced nor downscaled
         # without corrupting seq_len (see _vace_grid_mismatch).  It's a property of
         # the shapes, not of this step → take the same exit as an unsupported
@@ -393,6 +428,17 @@ def _make_tiled_forward(transformer):
                            f"step full-frame at full resolution. Tiling and multiscale "
                            f"are INACTIVE for this run.")
                 return orig(*args, **kwargs)
+
+        # Same for a y we can't put on the tile/downscaled grid: the forward cats it
+        # onto x's channel axis, so leaving it full-res raises from in here.
+        bad_y = _y_grid_mismatch(y, H, W)
+        if bad_y is not None:
+            _warn_once(f"y_grid_{bad_y}",
+                       f"[WanKJTiled] y {bad_y} is not a single [C,F,{H},{W}] tensor, so it "
+                       f"can't be sliced or downscaled to match x → running every step "
+                       f"full-frame at full resolution. Tiling and multiscale are INACTIVE "
+                       f"for this run.")
+            return orig(*args, **kwargs)
 
         # --- multiscale (coarse-to-fine) schedule ---------------------------------
         # kijai passes the 0-based step index straight into forward as
@@ -427,7 +473,7 @@ def _make_tiled_forward(transformer):
             else:
                 scale = max(1.0, min(100.0, _schedule_lookup(cfg["scale_sched"], step)))
 
-        if debug and warned.get("last_step_logged") != step:
+        if debug and warned["last_step_logged"] != step:
             warned["last_step_logged"] = step
             mode = (f"downscale {round(scale)}% (whole-frame)" if scale < 100
                     else ("tiled" if tile_on else "full"))
@@ -507,26 +553,33 @@ def _make_tiled_forward(transformer):
     return tiled_forward
 
 
-def _install_tiled_forward(transformer, cfg):
-    """Idempotently wrap ``transformer.forward`` and set the live tile config.
+def _install_tiled_forward(transformer, cfg, owner):
+    """Idempotently wrap ``transformer.forward`` and set the live tile config;
+    ``owner`` identifies the node instance for the collision check below.
 
-    kijai already mutates the transformer instance every run (block-swap flags,
-    etc.), so wrapping its forward in the same spirit is safe.  Re-applying just
-    updates ``_mago_tile_cfg``.
-
-    Note the wrap is installed on ``patcher.model.diffusion_model``, which
-    ``model.clone()`` SHARES — so both the wrapper and its cfg outlive this node.
-    While the node is in the graph that's fine (every run rewrites the cfg), but
-    if the node is later removed from the graph ``patch()`` stops running and the
-    last cfg keeps applying — a stale ``tiles_h/tiles_w`` keeps tiling, and a stale
-    ``scale_sched`` keeps downscaling, on runs that no longer use this node.
-    Reload the model (or re-add the node with ``bypass_tiling`` and an empty
-    schedule) to clear it.  Closing this properly needs an epoch stamp on the cfg
-    or an uninstall path; tracked separately."""
+    The wrap and cfg live on ``patcher.model.diffusion_model``, which ``clone()``
+    SHARES, and the forward never sees the patcher — so the cfg can't be scoped to
+    one clone.  Hence two nodes on one model: last ``patch()`` wins for every
+    sampler (warned below, use one node per model); and node removed from the graph:
+    the last cfg keeps applying until the model is reloaded.  A real fix needs
+    ``transformer_options`` in the forward, i.e. an upstream change."""
     if not getattr(transformer, "_mago_tiled_wrapped", False):
         transformer._mago_orig_forward = transformer.forward
         transformer.forward = _make_tiled_forward(transformer)
         transformer._mago_tiled_wrapped = True
+
+    owners = getattr(transformer, "_mago_tile_owners", None)
+    if owners is None:
+        owners = transformer._mago_tile_owners = {}
+    owners[owner] = cfg
+    if len(owners) > 1 and any(c != cfg for c in owners.values()):
+        _warn_once("multi_owner",
+                   f"[WanKJTiled] {len(owners)} tiled-patch nodes target the same model "
+                   f"with different settings. The cfg lives on the shared "
+                   f"diffusion_model, so EVERY sampler in this prompt uses whichever "
+                   f"node ran patch() last — not the one wired into it. Use one patch "
+                   f"node per model.")
+
     transformer._mago_tile_cfg = cfg
 
 
@@ -587,7 +640,7 @@ class WanVideoTiledPatch:
                "scale_sched": _parse_schedule(scale_schedule),
                "bypass_tiling": bypass_tiling, "debug": debug}
         m = model.clone()
-        _install_tiled_forward(m.model.diffusion_model, cfg)
+        _install_tiled_forward(m.model.diffusion_model, cfg, id(self))
         return (m,)
 
 

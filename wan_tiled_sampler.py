@@ -113,46 +113,34 @@ def _resize_spatial(t, out_h, out_w, mode):
 
 def _resize_cond_planes(t, out_h, out_w, ch_dim):
     """
-    Resize a conditioning tensor, choosing the interpolation per plane along
-    ``ch_dim`` from that plane's own values.
+    Resize a conditioning tensor, picking the interpolation per plane along
+    ``ch_dim`` from that plane's own values: exactly {0, 1} → ``nearest-exact``
+    (a mask, averaging it would give fractional occupancy), else ``area``.
 
-    Averaging a binary mask turns {0, 1} into fractional occupancy the model never
-    saw in training; point-sampling a latent drops the thin structures a control
-    signal is made of.  Channel arithmetic can't tell them apart — the packing
-    differs per node (I2V mask FIRST, VACE mask LAST, Fun-Control two latents and
-    no mask) — but values can: a mask plane is exactly {0, 1} everywhere.  Those
-    get ``nearest-exact``, the rest antialiased ``area``, order preserved.  Both
-    misreadings are benign (a feathered mask wants averaging anyway; an all-0/1
-    latent plane resizes the same either way).
+    Values, not channel arithmetic, because the packing differs per node: I2V mask
+    first, Wan22FunControl mask middle (concat_mask_index), VACE mask last,
+    Fun-Control no mask.  Misreadings are benign either way — a feathered mask
+    wants averaging; an all-0/1 latent plane resizes the same under both.
     """
     if t.shape[-2] == out_h and t.shape[-1] == out_w:
         return t
-    C = t.shape[ch_dim]
+    # Select on-device: reading the verdict on the host would sync the CUDA stream
+    # every step.  Costs one extra interpolate, saves the sync.
     is_binary = (t == 0) | (t == 1)
     for d in sorted((d for d in range(t.dim()) if d != ch_dim), reverse=True):
         is_binary = is_binary.all(dim=d)
-    binary = is_binary.tolist()
-    if not any(binary):
-        return _resize_spatial(t, out_h, out_w, "area")
-    if all(binary):
-        return _resize_spatial(t, out_h, out_w, "nearest-exact")
-    # Mixed: resize each contiguous run of like planes and re-concatenate in order.
-    parts, start = [], 0
-    for i in range(1, C + 1):
-        if i == C or binary[i] != binary[start]:
-            mode = "nearest-exact" if binary[start] else "area"
-            parts.append(_resize_spatial(t.narrow(ch_dim, start, i - start),
-                                         out_h, out_w, mode))
-            start = i
-    return torch.cat(parts, dim=ch_dim)
+    bshape = [1] * t.dim()
+    bshape[ch_dim] = -1
+    return torch.where(is_binary.reshape(bshape),
+                       _resize_spatial(t, out_h, out_w, "nearest-exact"),
+                       _resize_spatial(t, out_h, out_w, "area"))
 
 
-# Axis carrying the packed channel planes, per (conditioning key, rank).  An
-# unlisted rank is a layout we don't recognise → don't guess at its channel axis.
+# Plane axis for the keys that can pack a mask.  Unlisted key/rank → plain `area`
+# (layout we don't recognise, or all-signal like reference_latent).
 _COND_PLANE_AXIS = {
-    ("c_concat", 5): 1,          # (B, C, F, H, W)
-    ("reference_latent", 4): 1,  # (B, C, H, W)
-    ("vace_context", 6): 2,      # (B, num_refs, C, F, H, W)
+    ("c_concat", 5): 1,      # (B, C, F, H, W)
+    ("vace_context", 6): 2,  # (B, num_refs, C, F, H, W)
 }
 
 
@@ -296,9 +284,7 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
         for key in ("c_concat", "reference_latent", "vace_context"):
             v = c.get(key, None)
             if isinstance(v, torch.Tensor) and v.shape[-2] == H and v.shape[-1] == W:
-                # These pack latents and (I2V/VACE) binary mask planes along one axis
-                # in a per-node order, so the mode is picked per plane — see
-                # _resize_cond_planes.  Unknown rank → plain `area`.
+                # Mask planes sit at a per-node position → pick the mode per plane.
                 axis = _COND_PLANE_AXIS.get((key, v.dim()))
                 if axis is None:
                     c[key] = _resize_spatial(v, oh, ow, "area").contiguous()
