@@ -111,28 +111,49 @@ def _resize_spatial(t, out_h, out_w, mode):
     return x.reshape(*lead, out_h, out_w).to(t.dtype)
 
 
-def _resize_masked_cond(t, out_h, out_w, n_mask, ch_dim):
+def _resize_cond_planes(t, out_h, out_w, ch_dim):
     """
-    Resize a conditioning tensor whose leading ``n_mask`` channels along ``ch_dim``
-    are binary mask planes, splitting the interpolation by channel role.
+    Resize a conditioning tensor, choosing the interpolation per plane along
+    ``ch_dim`` from that plane's own values.
 
-    WAN's inpainting / I2V conditioning is ``cat([mask_planes, masked_latent])``.
-    The latent half is signal and wants antialiased ``area``, but averaging the
-    mask planes turns {0, 1} into fractional occupancy (0.25, 0.5, …) that the
-    model never saw in training — out of distribution exactly where inpainting
-    needs precision.  So masks go through ``nearest-exact`` (values stay binary)
-    and the signal channels through ``area``.
-
-    ``n_mask`` outside ``1..C-1`` means the layout wasn't recognised (no mask
-    planes, or a channel count we can't split) → plain ``area`` for the whole
-    tensor.
+    Averaging a binary mask turns {0, 1} into fractional occupancy the model never
+    saw in training; point-sampling a latent drops the thin structures a control
+    signal is made of.  Channel arithmetic can't tell them apart — the packing
+    differs per node (I2V mask FIRST, VACE mask LAST, Fun-Control two latents and
+    no mask) — but values can: a mask plane is exactly {0, 1} everywhere.  Those
+    get ``nearest-exact``, the rest antialiased ``area``, order preserved.  Both
+    misreadings are benign (a feathered mask wants averaging anyway; an all-0/1
+    latent plane resizes the same either way).
     """
+    if t.shape[-2] == out_h and t.shape[-1] == out_w:
+        return t
     C = t.shape[ch_dim]
-    if n_mask <= 0 or n_mask >= C:
+    is_binary = (t == 0) | (t == 1)
+    for d in sorted((d for d in range(t.dim()) if d != ch_dim), reverse=True):
+        is_binary = is_binary.all(dim=d)
+    binary = is_binary.tolist()
+    if not any(binary):
         return _resize_spatial(t, out_h, out_w, "area")
-    mask = _resize_spatial(t.narrow(ch_dim, 0, n_mask), out_h, out_w, "nearest-exact")
-    signal = _resize_spatial(t.narrow(ch_dim, n_mask, C - n_mask), out_h, out_w, "area")
-    return torch.cat([mask, signal], dim=ch_dim)
+    if all(binary):
+        return _resize_spatial(t, out_h, out_w, "nearest-exact")
+    # Mixed: resize each contiguous run of like planes and re-concatenate in order.
+    parts, start = [], 0
+    for i in range(1, C + 1):
+        if i == C or binary[i] != binary[start]:
+            mode = "nearest-exact" if binary[start] else "area"
+            parts.append(_resize_spatial(t.narrow(ch_dim, start, i - start),
+                                         out_h, out_w, mode))
+            start = i
+    return torch.cat(parts, dim=ch_dim)
+
+
+# Axis carrying the packed channel planes, per (conditioning key, rank).  An
+# unlisted rank is a layout we don't recognise → don't guess at its channel axis.
+_COND_PLANE_AXIS = {
+    ("c_concat", 5): 1,          # (B, C, F, H, W)
+    ("reference_latent", 4): 1,  # (B, C, H, W)
+    ("vace_context", 6): 2,      # (B, num_refs, C, F, H, W)
+}
 
 
 def _nearest_step(start_sigmas, sigma):
@@ -272,19 +293,17 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
         # below are signal, not noise, so they use antialiased `area`.
         x_small = _resize_spatial(x_full, oh, ow, "nearest-exact").contiguous()
         c = dict(input_dict.get("c", {}))
-        n_lat_ch = x_full.shape[1]
         for key in ("c_concat", "reference_latent", "vace_context"):
             v = c.get(key, None)
             if isinstance(v, torch.Tensor) and v.shape[-2] == H and v.shape[-1] == W:
-                if key == "c_concat" and v.dim() == 5:
-                    # c_concat is cat([mask_planes, masked_latent]) on the channel
-                    # axis; the mask planes are whatever it carries beyond the
-                    # latent's own channels and must not be averaged into
-                    # fractional values.  See _resize_masked_cond.
-                    c[key] = _resize_masked_cond(
-                        v, oh, ow, v.shape[1] - n_lat_ch, 1).contiguous()
-                else:
+                # These pack latents and (I2V/VACE) binary mask planes along one axis
+                # in a per-node order, so the mode is picked per plane — see
+                # _resize_cond_planes.  Unknown rank → plain `area`.
+                axis = _COND_PLANE_AXIS.get((key, v.dim()))
+                if axis is None:
                     c[key] = _resize_spatial(v, oh, ow, "area").contiguous()
+                else:
+                    c[key] = _resize_cond_planes(v, oh, ow, axis).contiguous()
         dm = c.get("denoise_mask", None)
         if isinstance(dm, torch.Tensor) and dm.shape[-2] == H and dm.shape[-1] == W:
             c["denoise_mask"] = _resize_spatial(dm, oh, ow, "nearest-exact").contiguous()

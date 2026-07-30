@@ -41,13 +41,16 @@ v1 scope (VACE inpainting, the wan22fun use case):
   * Not combined with kijai temporal context-windows in the same pass.
 """
 
+import contextlib
 import math
+import os
+
 import torch
 
 from .wan_tiled_sampler import (
     _compute_tile_starts, _make_window_1d,
     _parse_schedule, _schedule_lookup, _round_even, _resize_spatial,
-    _resize_masked_cond,
+    _resize_cond_planes,
 )
 
 
@@ -65,6 +68,47 @@ def _warn_once(key, msg):
     if key not in _WARNED:
         _WARNED.add(key)
         print(msg)
+
+
+try:  # present on any build that can run compile_args backend="inductor"
+    from torch._inductor import config as _inductor_config
+except Exception:  # minimal / non-inductor torch builds
+    _inductor_config = None
+
+
+@contextlib.contextmanager
+def _frugal_compile():
+    """Disable inductor's shape-padding pass for forwards run inside this block.
+
+    Every tile — and every downscaled pass — carries a token count the compiled
+    transformer has not seen before, so on a ``torch.compile``'d model with
+    ``dynamic=False`` (the WanVideoTorchCompileSettings default) the first such
+    forward triggers a fresh inductor compile *inside this wrapper*, at the worst
+    possible moment: both the high and low models resident and the sampler holding
+    its latents.  Inductor's ``pad_mm`` pass then benchmarks padded vs unpadded
+    matmuls for the tile's shapes (``should_pad_common`` → ``should_pad_bench`` →
+    ``do_bench`` → ``aten.addmm``), allocating GiB-scale scratch and OOMing the run
+    *during compilation* — the very failure the tiling was meant to avoid, and one
+    that surfaces as a ``BackendCompilerFailed`` pointing at this module rather than
+    at a sampling step.
+
+    ``shape_padding`` gates a compile-time graph pass, so switching it off around
+    the call only affects graphs compiled within the block; tile shapes already in
+    the compile cache run untouched.  The cost is therefore not a slower run but a
+    possibly-unpadded kernel for the graphs compiled here — the trade this node
+    exists to make.  Set ``MAGO_TILED_SHAPE_PADDING=1`` to keep torch's default.
+    """
+    if (_inductor_config is None
+            or not hasattr(_inductor_config, "shape_padding")
+            or os.environ.get("MAGO_TILED_SHAPE_PADDING") == "1"):
+        yield
+        return
+    prev = _inductor_config.shape_padding
+    _inductor_config.shape_padding = False
+    try:
+        yield
+    finally:
+        _inductor_config.shape_padding = prev
 
 # Conditioning kwargs that are spatially shaped and NOT handled by the tile
 # slicer yet.  If any is present and non-None we skip tiling for that call.
@@ -130,22 +174,39 @@ def _build_even_tile_specs(H, W, tiles_h, tiles_w, overlap_h, overlap_w, debug=F
     return specs
 
 
+def _vace_grid_mismatch(vace_data, H, W):
+    """Describe the first vace context that is NOT a ``[Cv, F, H, W]`` tensor on the
+    latent grid, or ``None`` when every context in every entry is one — i.e. when
+    ``_slice_vace_tile`` / ``_resize_vace_downscale`` can handle the whole list.
+
+    ``forward_vace`` sizes its hint tokens to the entry's ``seq_len``, which must
+    match the forward's own token count, so there is no per-entry escape: a context
+    left full-res is either silently truncated or a mid-run shape error.  Callers
+    bail to a full-frame forward instead."""
+    for entry in vace_data:
+        ctx_list = entry.get("context") if isinstance(entry, dict) else None
+        if not isinstance(ctx_list, (list, tuple)) or len(ctx_list) == 0:
+            return f"entry {type(entry).__name__} without a context list"
+        for ctx in ctx_list:
+            if not (isinstance(ctx, torch.Tensor) and ctx.dim() == 4
+                    and ctx.shape[-2] == H and ctx.shape[-1] == W):
+                return (str(tuple(ctx.shape)) if isinstance(ctx, torch.Tensor)
+                        else type(ctx).__name__)
+    return None
+
+
 def _slice_vace_tile(vace_data, H, W, hs, he, ws, we, tile_seq_len):
     """Slice each vace entry's context (list of [Cv, F, H, W]) to the tile and
     circular-pad H/W up to the spatial patch size, mirroring wan_tiled_sampler's
     VACE handling.  Sets the entry's ``seq_len`` to the tile's token count; keeps
     ``scale``/``start``/``end``.  Returns a new list (originals untouched).
 
-    A context whose H/W doesn't match the latent grid is passed through at full
-    resolution, and then the entry keeps its ORIGINAL ``seq_len`` — stamping the
-    tile's (smaller) token count on a full-res context makes ``forward_vace``
-    truncate it silently instead of failing, i.e. a quietly degraded control
-    signal."""
+    ``seq_len`` must equal the token count of the forward this feeds, so callers
+    clear ``_vace_grid_mismatch`` first; the else branch is a safety net."""
     out = []
     for entry in vace_data:
         ctx_list = entry["context"]
         new_ctx = []
-        passthrough = False
         for ctx in ctx_list:
             if isinstance(ctx, torch.Tensor) and ctx.dim() == 4 \
                     and ctx.shape[-2] == H and ctx.shape[-1] == W:
@@ -156,51 +217,42 @@ def _slice_vace_tile(vace_data, H, W, hs, he, ws, we, tile_seq_len):
                     tile = torch.nn.functional.pad(tile, (0, pw, 0, ph), mode="circular")
                 new_ctx.append(tile.contiguous())
             else:
-                # shape doesn't match the latent grid → pass through unchanged
                 new_ctx.append(ctx)
-                passthrough = True
                 shp = tuple(ctx.shape) if isinstance(ctx, torch.Tensor) else type(ctx).__name__
                 _warn_once(f"vace_slice_{shp}",
-                           f"[WanKJTiled] vace ctx {shp} doesn't match the latent grid "
-                           f"({H}x{W}) → passed to each tile at full resolution, and this "
-                           f"entry keeps its original seq_len. The VACE control signal is "
-                           f"NOT tiled for this entry.")
-        entry_out = {**entry, "context": new_ctx}
-        if not passthrough:
-            entry_out["seq_len"] = tile_seq_len
-        out.append(entry_out)
+                           f"[WanKJTiled] vace ctx {shp} reached the tile slicer without "
+                           f"matching the latent grid ({H}x{W}); it stays full-res while "
+                           f"seq_len follows the tile, so forward_vace will truncate this "
+                           f"entry's control signal. Please report this shape.")
+        out.append({**entry, "context": new_ctx, "seq_len": tile_seq_len})
     return out
 
 
 def _resize_vace_downscale(vace_data, H, W, oh, ow, new_seq_len):
     """Spatially downscale each vace entry's context (list of [Cv, F, H, W]) to
-    (oh, ow) with antialiased ``area`` (the context is clean signal, not noise),
-    and set the entry's ``seq_len`` to the downscaled token count.  Returns a new
-    list (originals untouched); contexts whose H/W don't match the latent grid are
-    passed through unchanged, and such an entry then keeps its ORIGINAL ``seq_len``
-    (see ``_slice_vace_tile`` — a full-res context stamped with the downscaled
-    token count gets silently truncated by ``forward_vace``)."""
+    (oh, ow) and set the entry's ``seq_len`` to the downscaled token count.  Returns
+    a new list (originals untouched).
+
+    A VACE context is ``cat([inactive, reactive, mask_planes])``, so the mode is
+    picked per plane (``_resize_cond_planes``) — the latents want ``area``, the
+    trailing pixel-unshuffled mask must stay binary.  Same ``seq_len`` invariant as
+    ``_slice_vace_tile``."""
     out = []
     for entry in vace_data:
         new_ctx = []
-        passthrough = False
         for ctx in entry["context"]:
             if isinstance(ctx, torch.Tensor) and ctx.dim() == 4 \
                     and ctx.shape[-2] == H and ctx.shape[-1] == W:
-                new_ctx.append(_resize_spatial(ctx, oh, ow, "area").contiguous())
+                new_ctx.append(_resize_cond_planes(ctx, oh, ow, 0).contiguous())
             else:
                 new_ctx.append(ctx)
-                passthrough = True
                 shp = tuple(ctx.shape) if isinstance(ctx, torch.Tensor) else type(ctx).__name__
                 _warn_once(f"vace_downscale_{shp}",
-                           f"[WanKJTiled] vace ctx {shp} doesn't match the latent grid "
-                           f"({H}x{W}) → not downscaled, and this entry keeps its original "
-                           f"seq_len. The VACE control signal stays full-res while the "
-                           f"latent is downscaled.")
-        entry_out = {**entry, "context": new_ctx}
-        if not passthrough:
-            entry_out["seq_len"] = new_seq_len
-        out.append(entry_out)
+                           f"[WanKJTiled] vace ctx {shp} reached the downscaler without "
+                           f"matching the latent grid ({H}x{W}); it stays full-res while "
+                           f"seq_len follows the downscaled latent, so forward_vace will "
+                           f"truncate this entry's control signal. Please report this shape.")
+        out.append({**entry, "context": new_ctx, "seq_len": new_seq_len})
     return out
 
 
@@ -243,15 +295,15 @@ def _run_downscaled_kj(orig, kwargs, scale, y, vace_data, vace_is_dict_list):
     if isinstance(y, (list, tuple)) and len(y) == 1 \
             and isinstance(y[0], torch.Tensor) and y[0].dim() == 4 \
             and y[0].shape[-2] == H and y[0].shape[-1] == W:
-        # y is cat([mask_planes, masked_latent]) on the channel axis for the
-        # inpainting / I2V paths.  Whatever y carries beyond the latent's own C
-        # channels is mask, and those planes must not be averaged into fractional
-        # occupancy — see _resize_masked_cond.  y[0] is [C, F, H, W] → ch_dim 0.
-        tkw["y"] = [_resize_masked_cond(y[0], oh, ow, y[0].shape[0] - C, 0).contiguous()]
+        # y is cat([mask, latent]) on I2V/FunInP but two stacked latents on the
+        # Fun-Control paths, so the mode is picked per plane from its values rather
+        # than from y's channel count — see _resize_cond_planes.  y[0] is 4D.
+        tkw["y"] = [_resize_cond_planes(y[0], oh, ow, 0).contiguous()]
     if vace_is_dict_list:
         tkw["vace_data"] = _resize_vace_downscale(vace_data, H, W, oh, ow, new_seq_len)
 
-    out = orig(**tkw)
+    with _frugal_compile():  # new token count → may compile here; keep it cheap
+        out = orig(**tkw)
     if not (isinstance(out, (list, tuple)) and len(out) == 2
             and isinstance(out[0], (list, tuple)) and len(out[0]) == 1
             and isinstance(out[0][0], torch.Tensor)):
@@ -326,6 +378,21 @@ def _make_tiled_forward(transformer):
         vace_data = kwargs.get("vace_data")
         vace_is_dict_list = (isinstance(vace_data, list) and len(vace_data) > 0
                              and isinstance(vace_data[0], dict))
+
+        # A vace context off the latent grid can be neither sliced nor downscaled
+        # without corrupting seq_len (see _vace_grid_mismatch).  It's a property of
+        # the shapes, not of this step → take the same exit as an unsupported
+        # spatial cond and run the whole frame.
+        if vace_is_dict_list:
+            bad_vace = _vace_grid_mismatch(vace_data, H, W)
+            if bad_vace is not None:
+                _warn_once(f"vace_grid_{bad_vace}",
+                           f"[WanKJTiled] vace context {bad_vace} is not on the latent "
+                           f"grid ({H}x{W}), so it can be neither tiled nor downscaled "
+                           f"without corrupting the VACE control signal → running every "
+                           f"step full-frame at full resolution. Tiling and multiscale "
+                           f"are INACTIVE for this run.")
+                return orig(*args, **kwargs)
 
         # --- multiscale (coarse-to-fine) schedule ---------------------------------
         # kijai passes the 0-based step index straight into forward as
@@ -411,7 +478,8 @@ def _make_tiled_forward(transformer):
                 tkw["vace_data"] = _slice_vace_tile(vace_data, H, W, hs, he, ws, we,
                                                     tile_seq_len)
 
-            out = orig(**tkw)
+            with _frugal_compile():  # new token count → may compile here; keep it cheap
+                out = orig(**tkw)
             # The forward contract is ([pred], cache); anything else can't be
             # blended, so bail to a full frame instead of raising out of a wrapper
             # the sampler doesn't know is there.
