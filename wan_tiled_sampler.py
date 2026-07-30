@@ -111,6 +111,30 @@ def _resize_spatial(t, out_h, out_w, mode):
     return x.reshape(*lead, out_h, out_w).to(t.dtype)
 
 
+def _resize_masked_cond(t, out_h, out_w, n_mask, ch_dim):
+    """
+    Resize a conditioning tensor whose leading ``n_mask`` channels along ``ch_dim``
+    are binary mask planes, splitting the interpolation by channel role.
+
+    WAN's inpainting / I2V conditioning is ``cat([mask_planes, masked_latent])``.
+    The latent half is signal and wants antialiased ``area``, but averaging the
+    mask planes turns {0, 1} into fractional occupancy (0.25, 0.5, …) that the
+    model never saw in training — out of distribution exactly where inpainting
+    needs precision.  So masks go through ``nearest-exact`` (values stay binary)
+    and the signal channels through ``area``.
+
+    ``n_mask`` outside ``1..C-1`` means the layout wasn't recognised (no mask
+    planes, or a channel count we can't split) → plain ``area`` for the whole
+    tensor.
+    """
+    C = t.shape[ch_dim]
+    if n_mask <= 0 or n_mask >= C:
+        return _resize_spatial(t, out_h, out_w, "area")
+    mask = _resize_spatial(t.narrow(ch_dim, 0, n_mask), out_h, out_w, "nearest-exact")
+    signal = _resize_spatial(t.narrow(ch_dim, n_mask, C - n_mask), out_h, out_w, "area")
+    return torch.cat([mask, signal], dim=ch_dim)
+
+
 def _nearest_step(start_sigmas, sigma):
     """Map an incoming sigma to a 0-based step index by nearest match against the
     per-step starting sigmas.  Robust to samplers that evaluate the model more
@@ -248,10 +272,19 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
         # below are signal, not noise, so they use antialiased `area`.
         x_small = _resize_spatial(x_full, oh, ow, "nearest-exact").contiguous()
         c = dict(input_dict.get("c", {}))
+        n_lat_ch = x_full.shape[1]
         for key in ("c_concat", "reference_latent", "vace_context"):
             v = c.get(key, None)
             if isinstance(v, torch.Tensor) and v.shape[-2] == H and v.shape[-1] == W:
-                c[key] = _resize_spatial(v, oh, ow, "area").contiguous()
+                if key == "c_concat" and v.dim() == 5:
+                    # c_concat is cat([mask_planes, masked_latent]) on the channel
+                    # axis; the mask planes are whatever it carries beyond the
+                    # latent's own channels and must not be averaged into
+                    # fractional values.  See _resize_masked_cond.
+                    c[key] = _resize_masked_cond(
+                        v, oh, ow, v.shape[1] - n_lat_ch, 1).contiguous()
+                else:
+                    c[key] = _resize_spatial(v, oh, ow, "area").contiguous()
         dm = c.get("denoise_mask", None)
         if isinstance(dm, torch.Tensor) and dm.shape[-2] == H and dm.shape[-1] == W:
             c["denoise_mask"] = _resize_spatial(dm, oh, ow, "nearest-exact").contiguous()

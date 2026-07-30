@@ -47,10 +47,24 @@ import torch
 from .wan_tiled_sampler import (
     _compute_tile_starts, _make_window_1d,
     _parse_schedule, _schedule_lookup, _round_even, _resize_spatial,
+    _resize_masked_cond,
 )
 
 
 _WAN_PATCH_SIZE_SPATIAL = 2  # WAN spatial patch size (temporal is 1)
+
+# Warnings that describe a persistent condition (a build that can't be scheduled,
+# a control signal left at full res) rather than a per-call event: print once per
+# process so a 40-step run doesn't emit 40 copies, but never gate them behind
+# `debug` — each one means the node is silently doing less than asked.
+_WARNED = set()
+
+
+def _warn_once(key, msg):
+    """Print ``msg`` the first time ``key`` is seen in this process."""
+    if key not in _WARNED:
+        _WARNED.add(key)
+        print(msg)
 
 # Conditioning kwargs that are spatially shaped and NOT handled by the tile
 # slicer yet.  If any is present and non-None we skip tiling for that call.
@@ -116,18 +130,25 @@ def _build_even_tile_specs(H, W, tiles_h, tiles_w, overlap_h, overlap_w, debug=F
     return specs
 
 
-def _slice_vace_tile(vace_data, hs, he, ws, we, tile_seq_len, debug=False):
+def _slice_vace_tile(vace_data, H, W, hs, he, ws, we, tile_seq_len):
     """Slice each vace entry's context (list of [Cv, F, H, W]) to the tile and
     circular-pad H/W up to the spatial patch size, mirroring wan_tiled_sampler's
     VACE handling.  Sets the entry's ``seq_len`` to the tile's token count; keeps
-    ``scale``/``start``/``end``.  Returns a new list (originals untouched)."""
+    ``scale``/``start``/``end``.  Returns a new list (originals untouched).
+
+    A context whose H/W doesn't match the latent grid is passed through at full
+    resolution, and then the entry keeps its ORIGINAL ``seq_len`` — stamping the
+    tile's (smaller) token count on a full-res context makes ``forward_vace``
+    truncate it silently instead of failing, i.e. a quietly degraded control
+    signal."""
     out = []
     for entry in vace_data:
         ctx_list = entry["context"]
         new_ctx = []
+        passthrough = False
         for ctx in ctx_list:
             if isinstance(ctx, torch.Tensor) and ctx.dim() == 4 \
-                    and ctx.shape[-2] >= he and ctx.shape[-1] >= we:
+                    and ctx.shape[-2] == H and ctx.shape[-1] == W:
                 tile = ctx[:, :, hs:he, ws:we]
                 ph = (_WAN_PATCH_SIZE_SPATIAL - tile.shape[-2] % _WAN_PATCH_SIZE_SPATIAL) % _WAN_PATCH_SIZE_SPATIAL
                 pw = (_WAN_PATCH_SIZE_SPATIAL - tile.shape[-1] % _WAN_PATCH_SIZE_SPATIAL) % _WAN_PATCH_SIZE_SPATIAL
@@ -137,36 +158,53 @@ def _slice_vace_tile(vace_data, hs, he, ws, we, tile_seq_len, debug=False):
             else:
                 # shape doesn't match the latent grid → pass through unchanged
                 new_ctx.append(ctx)
-                if debug:
-                    shp = tuple(ctx.shape) if isinstance(ctx, torch.Tensor) else type(ctx).__name__
-                    print(f"[WanKJTiled] vace ctx not sliced (shape {shp})")
-        out.append({**entry, "context": new_ctx, "seq_len": tile_seq_len})
+                passthrough = True
+                shp = tuple(ctx.shape) if isinstance(ctx, torch.Tensor) else type(ctx).__name__
+                _warn_once(f"vace_slice_{shp}",
+                           f"[WanKJTiled] vace ctx {shp} doesn't match the latent grid "
+                           f"({H}x{W}) → passed to each tile at full resolution, and this "
+                           f"entry keeps its original seq_len. The VACE control signal is "
+                           f"NOT tiled for this entry.")
+        entry_out = {**entry, "context": new_ctx}
+        if not passthrough:
+            entry_out["seq_len"] = tile_seq_len
+        out.append(entry_out)
     return out
 
 
-def _resize_vace_downscale(vace_data, H, W, oh, ow, new_seq_len, debug=False):
+def _resize_vace_downscale(vace_data, H, W, oh, ow, new_seq_len):
     """Spatially downscale each vace entry's context (list of [Cv, F, H, W]) to
     (oh, ow) with antialiased ``area`` (the context is clean signal, not noise),
     and set the entry's ``seq_len`` to the downscaled token count.  Returns a new
     list (originals untouched); contexts whose H/W don't match the latent grid are
-    passed through unchanged."""
+    passed through unchanged, and such an entry then keeps its ORIGINAL ``seq_len``
+    (see ``_slice_vace_tile`` — a full-res context stamped with the downscaled
+    token count gets silently truncated by ``forward_vace``)."""
     out = []
     for entry in vace_data:
         new_ctx = []
+        passthrough = False
         for ctx in entry["context"]:
             if isinstance(ctx, torch.Tensor) and ctx.dim() == 4 \
                     and ctx.shape[-2] == H and ctx.shape[-1] == W:
                 new_ctx.append(_resize_spatial(ctx, oh, ow, "area").contiguous())
             else:
                 new_ctx.append(ctx)
-                if debug:
-                    shp = tuple(ctx.shape) if isinstance(ctx, torch.Tensor) else type(ctx).__name__
-                    print(f"[WanKJTiled] vace ctx not downscaled (shape {shp})")
-        out.append({**entry, "context": new_ctx, "seq_len": new_seq_len})
+                passthrough = True
+                shp = tuple(ctx.shape) if isinstance(ctx, torch.Tensor) else type(ctx).__name__
+                _warn_once(f"vace_downscale_{shp}",
+                           f"[WanKJTiled] vace ctx {shp} doesn't match the latent grid "
+                           f"({H}x{W}) → not downscaled, and this entry keeps its original "
+                           f"seq_len. The VACE control signal stays full-res while the "
+                           f"latent is downscaled.")
+        entry_out = {**entry, "context": new_ctx}
+        if not passthrough:
+            entry_out["seq_len"] = new_seq_len
+        out.append(entry_out)
     return out
 
 
-def _run_downscaled_kj(orig, kwargs, scale, y, vace_data, vace_is_dict_list, debug=False):
+def _run_downscaled_kj(orig, kwargs, scale, y, vace_data, vace_is_dict_list):
     """Multiscale (coarse-to-fine) whole-frame pass for the kijai forward.
 
     Downscales the latent (and its spatially-shaped conditioning) to ``scale`` %,
@@ -196,29 +234,48 @@ def _run_downscaled_kj(orig, kwargs, scale, y, vace_data, vace_is_dict_list, deb
     tkw = dict(kwargs)
     tkw["x"] = [x_small]
     tkw["seq_len"] = new_seq_len
+    if kwargs.get("pred_id") is not None:
+        _warn_once("teacache_downscale",
+                   "[WanKJTiled] pred_id/teacache active → disabled for the downscaled "
+                   "pass (its token layout differs from full-res).")
     tkw["pred_id"] = None  # token layout differs from full-res → teacache invalid
 
     if isinstance(y, (list, tuple)) and len(y) == 1 \
             and isinstance(y[0], torch.Tensor) and y[0].dim() == 4 \
             and y[0].shape[-2] == H and y[0].shape[-1] == W:
-        tkw["y"] = [_resize_spatial(y[0], oh, ow, "area").contiguous()]
+        # y is cat([mask_planes, masked_latent]) on the channel axis for the
+        # inpainting / I2V paths.  Whatever y carries beyond the latent's own C
+        # channels is mask, and those planes must not be averaged into fractional
+        # occupancy — see _resize_masked_cond.  y[0] is [C, F, H, W] → ch_dim 0.
+        tkw["y"] = [_resize_masked_cond(y[0], oh, ow, y[0].shape[0] - C, 0).contiguous()]
     if vace_is_dict_list:
-        tkw["vace_data"] = _resize_vace_downscale(vace_data, H, W, oh, ow,
-                                                  new_seq_len, debug=debug)
+        tkw["vace_data"] = _resize_vace_downscale(vace_data, H, W, oh, ow, new_seq_len)
 
-    pred, cache = orig(**tkw)
-    if isinstance(pred, (list, tuple)) and len(pred) == 1 \
-            and isinstance(pred[0], torch.Tensor) and pred[0].shape[-2:] == (oh, ow):
-        # Always hand the sampler a full-resolution prediction so its latent state
-        # stays full-res across the whole run (and any high/low-noise split).
-        up = _resize_spatial(pred[0], H, W, "bilinear").to(x[0].dtype)
-        return [up], cache
-    if debug:
-        info = (tuple(pred[0].shape) if isinstance(pred, (list, tuple))
-                and pred and isinstance(pred[0], torch.Tensor) else type(pred).__name__)
-        print(f"[WanKJTiled] downscaled pred shape {info} != ({oh},{ow}); "
-              f"returning as-is (no upscale).")
-    return pred, cache
+    out = orig(**tkw)
+    if not (isinstance(out, (list, tuple)) and len(out) == 2
+            and isinstance(out[0], (list, tuple)) and len(out[0]) == 1
+            and isinstance(out[0][0], torch.Tensor)):
+        _warn_once("downscale_ret",
+                   f"[WanKJTiled] downscaled forward returned {type(out).__name__}, not "
+                   f"([tensor], cache) — cannot upscale it back to ({H},{W}). The sampler "
+                   f"is receiving whatever the transformer returned, at reduced resolution.")
+        return out
+    pred, cache = out
+    # Always hand the sampler a full-resolution prediction so its latent state
+    # stays full-res across the whole run (and any high/low-noise split).  Resize
+    # whenever the prediction isn't already full-res, not only from the expected
+    # (oh, ow): on any unexpected size the alternative is leaking a downscaled
+    # latent into the sampler's full-res update.  Mirrors wan_tiled_sampler's
+    # _run_downscaled, which tests `!= (H, W)` for the same reason.
+    if pred[0].shape[-2:] == (H, W):
+        return pred, cache
+    if pred[0].shape[-2:] != (oh, ow):
+        _warn_once("downscale_shape",
+                   f"[WanKJTiled] downscaled pred shape {tuple(pred[0].shape)} is neither "
+                   f"the requested ({oh},{ow}) nor full-res ({H},{W}); resizing to full-res "
+                   f"anyway. Check the WanVideoWrapper build's forward contract.")
+    up = _resize_spatial(pred[0], H, W, "bilinear").to(x[0].dtype)
+    return [up], cache
 
 
 def _make_tiled_forward(transformer):
@@ -240,8 +297,13 @@ def _make_tiled_forward(transformer):
         tiles_h, tiles_w = cfg["tiles_h"], cfg["tiles_w"]
         debug = cfg["debug"]
         sched_active = cfg.get("scale_sched") is not None
-        # bypass only when there's nothing to do: no tiling AND no multiscale.
-        if cfg["bypass_tiling"] or ((tiles_h <= 1 and tiles_w <= 1) and not sched_active):
+        # `bypass_tiling` means "no tiling", NOT "no multiscale" — same contract as
+        # the native node (wan_tiled_sampler: `default_tile_on` at _patch_model, and
+        # the early-out at WanTiledSampler.sample) and as documented in README.md's
+        # bypass_tiling row and its tooltip.  So tiling is gated by `tile_on`, and
+        # the wrapper only steps aside when there is nothing at all to do.
+        tile_on = (tiles_h > 1 or tiles_w > 1) and not cfg["bypass_tiling"]
+        if not sched_active and not tile_on:
             return orig(*args, **kwargs)
 
         x = kwargs["x"]
@@ -271,22 +333,51 @@ def _make_tiled_forward(transformer):
         # no sigma matching.  scale < 100 → downscale the whole frame (tiling off);
         # scale == 100 → tiled path below.  Natural pairing: low-res whole-frame
         # early → full-res tiled late.
-        step = int(kwargs.get("current_step", 0) or 0)
+        #
+        # A missing `current_step` must NOT be read as step 0: on a build that
+        # doesn't forward it, every step would resolve to the schedule's first
+        # entry, pinning the whole run to (say) 50% with tiling never engaging —
+        # uniformly soft output and no error.  Unknown step → no schedule, which
+        # degrades to plain full-res tiling rather than to a silent downscale.
+        # (The native node avoids this entirely by deriving the step from
+        # transformer_options["sample_sigmas"], which kijai's loop doesn't pass.)
+        step = None
+        cs = kwargs.get("current_step")
+        if cs is not None:
+            try:
+                step = int(cs)
+            except (TypeError, ValueError):
+                step = None
+
         scale = 100.0
-        if cfg.get("scale_sched") is not None:
-            scale = max(1.0, min(100.0, _schedule_lookup(cfg["scale_sched"], step)))
+        if sched_active:
+            if step is None:
+                _warn_once("no_current_step",
+                           "[WanKJTiled] this WanVideoWrapper build does not pass "
+                           "`current_step` into transformer.forward, so scale_schedule "
+                           "cannot be resolved → running every step at full resolution "
+                           "(tiling only). Multiscale is INACTIVE.")
+            else:
+                scale = max(1.0, min(100.0, _schedule_lookup(cfg["scale_sched"], step)))
 
         if debug and warned.get("last_step_logged") != step:
             warned["last_step_logged"] = step
-            mode = f"downscale {round(scale)}% (whole-frame)" if scale < 100 else "tiled"
-            print(f"[WanKJTiled] step {step}: scale={round(scale)}% → {mode}")
+            mode = (f"downscale {round(scale)}% (whole-frame)" if scale < 100
+                    else ("tiled" if tile_on else "full"))
+            print(f"[WanKJTiled] step {step if step is not None else '?'}: "
+                  f"scale={round(scale)}% → {mode}")
 
         if scale < 100:
             res = _run_downscaled_kj(orig, kwargs, scale, y, vace_data,
-                                     vace_is_dict_list, debug=debug)
+                                     vace_is_dict_list)
             if res is not None:
                 return res
             # target size wasn't actually smaller → fall through to tiling / full
+
+        # At scale == 100 under bypass_tiling there is nothing left to do: run the
+        # full frame, or bypass would lose its meaning on exactly those steps.
+        if not tile_on:
+            return orig(*args, **kwargs)
 
         specs = _build_even_tile_specs(H, W, tiles_h, tiles_w,
                                        cfg["overlap_h"], cfg["overlap_w"], debug=debug)
@@ -317,11 +408,20 @@ def _make_tiled_forward(transformer):
                     and y[0].shape[-2] == H and y[0].shape[-1] == W:
                 tkw["y"] = [y[0][:, :, hs:he, ws:we].contiguous()]
             if vace_is_dict_list:
-                tkw["vace_data"] = _slice_vace_tile(vace_data, hs, he, ws, we,
-                                                    tile_seq_len, debug=debug)
+                tkw["vace_data"] = _slice_vace_tile(vace_data, H, W, hs, he, ws, we,
+                                                    tile_seq_len)
 
-            pred, _ = orig(**tkw)
-            tile_pred = pred[0]
+            out = orig(**tkw)
+            # The forward contract is ([pred], cache); anything else can't be
+            # blended, so bail to a full frame instead of raising out of a wrapper
+            # the sampler doesn't know is there.
+            if not (isinstance(out, (list, tuple)) and len(out) == 2
+                    and isinstance(out[0], (list, tuple)) and len(out[0]) == 1
+                    and isinstance(out[0][0], torch.Tensor)):
+                print(f"[WanKJTiled] unexpected forward return {type(out).__name__} "
+                      f"for a tile; falling back to full forward.")
+                return orig(*args, **kwargs)
+            tile_pred = out[0][0]
             if tile_pred.shape[-2:] != (th, tw):
                 # transformer returned an unexpected spatial size → abort tiling
                 # cleanly with a full-frame pass rather than a corrupt blend.
@@ -344,8 +444,17 @@ def _install_tiled_forward(transformer, cfg):
 
     kijai already mutates the transformer instance every run (block-swap flags,
     etc.), so wrapping its forward in the same spirit is safe.  Re-applying just
-    updates ``_mago_tile_cfg``; ``bypass_tiling``/``tiles<=1`` make the wrapper a
-    pure passthrough, so a persisted wrap never changes non-tiled behaviour."""
+    updates ``_mago_tile_cfg``.
+
+    Note the wrap is installed on ``patcher.model.diffusion_model``, which
+    ``model.clone()`` SHARES — so both the wrapper and its cfg outlive this node.
+    While the node is in the graph that's fine (every run rewrites the cfg), but
+    if the node is later removed from the graph ``patch()`` stops running and the
+    last cfg keeps applying — a stale ``tiles_h/tiles_w`` keeps tiling, and a stale
+    ``scale_sched`` keeps downscaling, on runs that no longer use this node.
+    Reload the model (or re-add the node with ``bypass_tiling`` and an empty
+    schedule) to clear it.  Closing this properly needs an epoch stamp on the cfg
+    or an uninstall path; tracked separately."""
     if not getattr(transformer, "_mago_tiled_wrapped", False):
         transformer._mago_orig_forward = transformer.forward
         transformer.forward = _make_tiled_forward(transformer)
@@ -360,11 +469,14 @@ class WanVideoTiledPatch:
     native-4k) while keeping large temporal chunks and coherent global motion.  Plug
     the patched model into ``WanVideoSampler``.
 
-    Multiscale (the coarse-to-fine idea ported from LTX, matching the native
-    ``WanTiledSamplerPatch``): early high-sigma steps run the whole frame at reduced
-    resolution — smaller latent → RoPE/token count back in training distribution →
-    global motion stays coherent; late steps run full-res tiled to recover detail.
-    Empty ``scale_schedule`` = tiling only (unchanged behaviour)."""
+    Multiscale (coarse-to-fine, matching the native ``WanTiledSamplerPatch``): early
+    high-sigma steps run the whole frame at reduced resolution — smaller latent →
+    RoPE/token count back in training distribution → global motion stays coherent;
+    late steps run full-res tiled to recover detail.  Empty ``scale_schedule`` =
+    tiling only (unchanged behaviour).  The coarse-to-fine approach is based on the
+    LTX-Video tiled-sampler work — Lightricks' official implementation and the 10S
+    Nodes investigation into long-context sampling degradation — reworked here for
+    WAN rather than ported from it."""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -388,7 +500,9 @@ class WanVideoTiledPatch:
                                    "resolution (tiling off, keeps global motion coherent); "
                                    "at 100 it runs tiled. Empty = always full-res (tiling only)."}),
                 "bypass_tiling": ("BOOLEAN", {"default": False,
-                                  "tooltip": "Pass through unchanged (plain WanVideoSampler)."}),
+                                  "tooltip": "Skip tiling (unless a scale_schedule is set — "
+                                  "a schedule still runs its downscaled steps). With no "
+                                  "schedule this is a plain WanVideoSampler passthrough."}),
                 "debug": ("BOOLEAN", {"default": False,
                           "tooltip": "Print tile layout + blend-weight sanity check + per-step scale."}),
             },
