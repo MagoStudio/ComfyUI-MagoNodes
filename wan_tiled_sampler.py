@@ -111,6 +111,36 @@ def _resize_spatial(t, out_h, out_w, mode):
     return x.reshape(*lead, out_h, out_w).to(t.dtype)
 
 
+def _downscale_target(H, W, scale):
+    """``(out_h, out_w)`` for a ``scale`` % downscale of an ``H``x``W`` latent, or
+    ``None`` when that target isn't actually smaller (caller runs full-res).
+
+    Shared by both multiscale paths (native ``_run_downscaled`` and the kijai
+    ``_run_downscaled_kj``) so the even-rounding and the "is this a downscale at
+    all" predicate can't drift apart between them."""
+    oh, ow = _round_even(H * scale / 100.0), _round_even(W * scale / 100.0)
+    if oh >= H and ow >= W:
+        return None
+    return oh, ow
+
+
+def _restore_full_res(pred, H, W, dtype):
+    """Return ``pred`` at ``H``x``W`` in ``dtype``, resizing only if needed.
+
+    Both multiscale paths must hand the sampler a full-resolution prediction: the
+    sampler's latent state stays full-res for the whole run (and across a WAN 2.2
+    high/low-noise split), so a downscale must never persist into its update.  The
+    size test is ``!= (H, W)`` rather than ``== (out_h, out_w)`` on purpose — on an
+    unexpected size the alternative is leaking a reduced-res latent.  The dtype cast
+    is a no-op when they already match (autocast can return float32 against fp16
+    latents).  Non-tensor predictions pass through untouched."""
+    if not isinstance(pred, torch.Tensor):
+        return pred
+    if pred.shape[-2:] != (H, W):
+        pred = _resize_spatial(pred, H, W, "bilinear")
+    return pred.to(dtype)
+
+
 def _resize_cond_planes(t, out_h, out_w, ch_dim):
     """
     Resize a conditioning tensor, picking the interpolation per plane along
@@ -267,9 +297,10 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
     def _run_downscaled(model_fn, input_dict, scale):
         x_full = input_dict["input"]
         H, W = x_full.shape[-2], x_full.shape[-1]
-        oh, ow = _round_even(H * scale / 100.0), _round_even(W * scale / 100.0)
-        if oh >= H and ow >= W:
+        target = _downscale_target(H, W, scale)
+        if target is None:
             return _call_model(model_fn, input_dict)
+        oh, ow = target
 
         # Downscale the noisy latent by SUBSAMPLING (nearest), not averaging.
         # At high sigma x is noise-dominated; averaging (area/bilinear) collapses
@@ -296,13 +327,9 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
 
         d = {**input_dict, "input": x_small, "c": c}
         pred = _call_model(model_fn, d)
-        # Always hand the sampler a full-resolution prediction: the sampler's
-        # latent state stays full-res across the whole run (and across WAN 2.2
-        # high/low-noise sampler passes), so the downscale never persists — the
-        # next pass always receives a full-res latent regardless of its schedule.
-        if isinstance(pred, torch.Tensor) and pred.shape[-2:] != (H, W):
-            pred = _resize_spatial(pred, H, W, "bilinear")
-        return pred.to(x_full.dtype) if isinstance(pred, torch.Tensor) else pred
+        # Always hand the sampler a full-resolution prediction — see
+        # _restore_full_res for why (shared with the kijai multiscale path).
+        return _restore_full_res(pred, H, W, x_full.dtype)
 
     def _run_tiled(model_fn, input_dict, tile_specs):
         x_full = input_dict["input"]
