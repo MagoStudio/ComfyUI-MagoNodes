@@ -173,6 +173,27 @@ _COND_PLANE_AXIS = {
     ("vace_context", 6): 2,  # (B, num_refs, C, F, H, W)
 }
 
+# Conditioning keys _run_downscaled resizes in lockstep with x.  Checked against
+# the latent grid up front (see _cond_grid_mismatch) — a downscale must resize
+# all of these together or not at all.
+_DOWNSCALED_COND_KEYS = ("c_concat", "reference_latent", "vace_context", "denoise_mask")
+
+
+def _cond_grid_mismatch(c, H, W):
+    """Describe the first tensor in ``_DOWNSCALED_COND_KEYS`` that is present but
+    NOT on the latent grid (H, W), or ``None`` when every present one is.
+
+    ``_run_downscaled`` resizes ``x`` and this conditioning together; a tensor
+    that doesn't already match (H, W) can't be resized in lockstep by the same
+    logic that resizes x, so leaving it untouched would pair a downscaled x with
+    full-res conditioning — the same corruption ``_vace_grid_mismatch`` /
+    ``_y_grid_mismatch`` bail out on in the kijai path.  Callers run full-res."""
+    for key in _DOWNSCALED_COND_KEYS:
+        v = c.get(key, None)
+        if isinstance(v, torch.Tensor) and (v.shape[-2] != H or v.shape[-1] != W):
+            return f"{key} {tuple(v.shape)}"
+    return None
+
 
 def _nearest_step(start_sigmas, sigma):
     """Map an incoming sigma to a 0-based step index by nearest match against the
@@ -280,6 +301,12 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
     sched_active = scale_sched is not None
     last_logged = [-1]
     specs_cache = {}
+    warned = set()
+
+    def _warn_once(key, msg):
+        if key not in warned:
+            warned.add(key)
+            print(msg)
 
     def _get_specs(H, W):
         key = (H, W)
@@ -302,6 +329,18 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
             return _call_model(model_fn, input_dict)
         oh, ow = target
 
+        c = input_dict.get("c", {})
+        bad = _cond_grid_mismatch(c, H, W)
+        if bad is not None:
+            # Off-grid conditioning can't be resized in lockstep with x → running
+            # it downscaled would pair a small x with full-res conditioning.
+            _warn_once(f"cond_grid_{bad}",
+                       f"[WanTiled] conditioning {bad} is not on the latent grid "
+                       f"({H}x{W}), so it can't be downscaled in lockstep with x "
+                       f"→ running this step full-res. Multiscale is INACTIVE "
+                       f"while this conditioning is attached.")
+            return _call_model(model_fn, input_dict)
+
         # Downscale the noisy latent by SUBSAMPLING (nearest), not averaging.
         # At high sigma x is noise-dominated; averaging (area/bilinear) collapses
         # the noise variance, so the model would receive a latent whose noise
@@ -311,10 +350,10 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
         # flow- and eps-parameterised models).  The clean conditioning tensors
         # below are signal, not noise, so they use antialiased `area`.
         x_small = _resize_spatial(x_full, oh, ow, "nearest-exact").contiguous()
-        c = dict(input_dict.get("c", {}))
+        c = dict(c)
         for key in ("c_concat", "reference_latent", "vace_context"):
             v = c.get(key, None)
-            if isinstance(v, torch.Tensor) and v.shape[-2] == H and v.shape[-1] == W:
+            if isinstance(v, torch.Tensor):
                 # Mask planes sit at a per-node position → pick the mode per plane.
                 axis = _COND_PLANE_AXIS.get((key, v.dim()))
                 if axis is None:
@@ -322,7 +361,7 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
                 else:
                     c[key] = _resize_cond_planes(v, oh, ow, axis).contiguous()
         dm = c.get("denoise_mask", None)
-        if isinstance(dm, torch.Tensor) and dm.shape[-2] == H and dm.shape[-1] == W:
+        if isinstance(dm, torch.Tensor):
             c["denoise_mask"] = _resize_spatial(dm, oh, ow, "nearest-exact").contiguous()
 
         d = {**input_dict, "input": x_small, "c": c}
