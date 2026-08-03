@@ -538,7 +538,9 @@ def _make_tiled_forward(transformer):
                                      vace_is_dict_list)
             if res is not None:
                 return res
-            # target size wasn't actually smaller → fall through to tiling / full
+            # Target rounded back to full size, but a scale < 100 step still means
+            # one whole-frame pass (tiling off), same as native `_run_downscaled`.
+            return orig(*args, **kwargs)
 
         # At scale == 100 under bypass_tiling there is nothing left to do: run the
         # full frame, or bypass would lose its meaning on exactly those steps.
