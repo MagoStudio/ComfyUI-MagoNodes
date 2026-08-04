@@ -228,3 +228,11 @@ drop it too. The nodes are prompt/model-agnostic: they cache any `CONDITIONING`.
   trapezoidal blend-window formula).
 - [10S Nodes](https://github.com/TenStrip/10S-Comfy-nodes) — investigation on
   long-context sampling degradation.
+
+**On the LTX lineage.** The WAN nodes are not a port of any LTX node. The
+coarse-to-fine multiscale idea and the tiling machinery are *based on* the LTX
+tiled-sampler work — Lightricks' official implementation and 10S Nodes — but the
+schedule handling, the conditioning adaptation, and the WAN-specific RoPE /
+token-count reasoning were written for WAN. The same applies to the LTX node
+itself, whose guide-conditioning logic is based on 10S Nodes with the coordinate
+and grid-mask handling reworked to fix correctness bugs.

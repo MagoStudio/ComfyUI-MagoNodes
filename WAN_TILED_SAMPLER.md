@@ -100,6 +100,12 @@ the model still decides motion per tile from local context.  In V2V the control
 video pins the motion, so tiles agree; in I2V there is no such pin and tiles
 drift apart over the sequence even though the first frame / reference is honoured.
 
+Deciding structure at low resolution first is the coarse-to-fine idea the LTX
+tiled samplers use (Lightricks' official implementation and the 10S Nodes work on
+long-context degradation).  What follows is based on that idea, not ported from
+it: the schedule handling and every conditioning-adaptation rule below are
+WAN-specific.
+
 The fix is to decide global motion *before* tiling, at low resolution.  WAN's
 `rope_encode(t_len, h, w, …)` derives positional encodings directly from the
 latent's spatial dims, and `_forward` crops its output back to the input dims.

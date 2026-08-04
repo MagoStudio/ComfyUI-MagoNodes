@@ -111,6 +111,90 @@ def _resize_spatial(t, out_h, out_w, mode):
     return x.reshape(*lead, out_h, out_w).to(t.dtype)
 
 
+def _downscale_target(H, W, scale):
+    """``(out_h, out_w)`` for a ``scale`` % downscale of an ``H``x``W`` latent, or
+    ``None`` when that target isn't actually smaller (caller runs full-res).
+
+    Shared by both multiscale paths (native ``_run_downscaled`` and the kijai
+    ``_run_downscaled_kj``) so the even-rounding and the "is this a downscale at
+    all" predicate can't drift apart between them."""
+    oh, ow = _round_even(H * scale / 100.0), _round_even(W * scale / 100.0)
+    if oh >= H and ow >= W:
+        return None
+    return oh, ow
+
+
+def _restore_full_res(pred, H, W, dtype):
+    """Return ``pred`` at ``H``x``W`` in ``dtype``, resizing only if needed.
+
+    Both multiscale paths must hand the sampler a full-resolution prediction: the
+    sampler's latent state stays full-res for the whole run (and across a WAN 2.2
+    high/low-noise split), so a downscale must never persist into its update.  The
+    size test is ``!= (H, W)`` rather than ``== (out_h, out_w)`` on purpose — on an
+    unexpected size the alternative is leaking a reduced-res latent.  The dtype cast
+    is a no-op when they already match (autocast can return float32 against fp16
+    latents).  Non-tensor predictions pass through untouched."""
+    if not isinstance(pred, torch.Tensor):
+        return pred
+    if pred.shape[-2:] != (H, W):
+        pred = _resize_spatial(pred, H, W, "bilinear")
+    return pred.to(dtype)
+
+
+def _resize_cond_planes(t, out_h, out_w, ch_dim):
+    """
+    Resize a conditioning tensor, picking the interpolation per plane along
+    ``ch_dim`` from that plane's own values: exactly {0, 1} → ``nearest-exact``
+    (a mask, averaging it would give fractional occupancy), else ``area``.
+
+    Values, not channel arithmetic, because the packing differs per node: I2V mask
+    first, Wan22FunControl mask middle (concat_mask_index), VACE mask last,
+    Fun-Control no mask.  Misreadings are benign either way — a feathered mask
+    wants averaging; an all-0/1 latent plane resizes the same under both.
+    """
+    if t.shape[-2] == out_h and t.shape[-1] == out_w:
+        return t
+    # Select on-device: reading the verdict on the host would sync the CUDA stream
+    # every step.  Costs one extra interpolate, saves the sync.
+    is_binary = (t == 0) | (t == 1)
+    for d in sorted((d for d in range(t.dim()) if d != ch_dim), reverse=True):
+        is_binary = is_binary.all(dim=d)
+    bshape = [1] * t.dim()
+    bshape[ch_dim] = -1
+    return torch.where(is_binary.reshape(bshape),
+                       _resize_spatial(t, out_h, out_w, "nearest-exact"),
+                       _resize_spatial(t, out_h, out_w, "area"))
+
+
+# Plane axis for the keys that can pack a mask.  Unlisted key/rank → plain `area`
+# (layout we don't recognise, or all-signal like reference_latent).
+_COND_PLANE_AXIS = {
+    ("c_concat", 5): 1,      # (B, C, F, H, W)
+    ("vace_context", 6): 2,  # (B, num_refs, C, F, H, W)
+}
+
+# Conditioning keys _run_downscaled resizes in lockstep with x.  Checked against
+# the latent grid up front (see _cond_grid_mismatch) — a downscale must resize
+# all of these together or not at all.
+_DOWNSCALED_COND_KEYS = ("c_concat", "reference_latent", "vace_context", "denoise_mask")
+
+
+def _cond_grid_mismatch(c, H, W):
+    """Describe the first tensor in ``_DOWNSCALED_COND_KEYS`` that is present but
+    NOT on the latent grid (H, W), or ``None`` when every present one is.
+
+    ``_run_downscaled`` resizes ``x`` and this conditioning together; a tensor
+    that doesn't already match (H, W) can't be resized in lockstep by the same
+    logic that resizes x, so leaving it untouched would pair a downscaled x with
+    full-res conditioning — the same corruption ``_vace_grid_mismatch`` /
+    ``_y_grid_mismatch`` bail out on in the kijai path.  Callers run full-res."""
+    for key in _DOWNSCALED_COND_KEYS:
+        v = c.get(key, None)
+        if isinstance(v, torch.Tensor) and (v.shape[-2] != H or v.shape[-1] != W):
+            return f"{key} {tuple(v.shape)}"
+    return None
+
+
 def _nearest_step(start_sigmas, sigma):
     """Map an incoming sigma to a 0-based step index by nearest match against the
     per-step starting sigmas.  Robust to samplers that evaluate the model more
@@ -217,6 +301,12 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
     sched_active = scale_sched is not None
     last_logged = [-1]
     specs_cache = {}
+    warned = set()
+
+    def _warn_once(key, msg):
+        if key not in warned:
+            warned.add(key)
+            print(msg)
 
     def _get_specs(H, W):
         key = (H, W)
@@ -234,8 +324,21 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
     def _run_downscaled(model_fn, input_dict, scale):
         x_full = input_dict["input"]
         H, W = x_full.shape[-2], x_full.shape[-1]
-        oh, ow = _round_even(H * scale / 100.0), _round_even(W * scale / 100.0)
-        if oh >= H and ow >= W:
+        target = _downscale_target(H, W, scale)
+        if target is None:
+            return _call_model(model_fn, input_dict)
+        oh, ow = target
+
+        c = input_dict.get("c", {})
+        bad = _cond_grid_mismatch(c, H, W)
+        if bad is not None:
+            # Off-grid conditioning can't be resized in lockstep with x → running
+            # it downscaled would pair a small x with full-res conditioning.
+            _warn_once(f"cond_grid_{bad}",
+                       f"[WanTiled] conditioning {bad} is not on the latent grid "
+                       f"({H}x{W}), so it can't be downscaled in lockstep with x "
+                       f"→ running this step full-res. Multiscale is INACTIVE "
+                       f"while this conditioning is attached.")
             return _call_model(model_fn, input_dict)
 
         # Downscale the noisy latent by SUBSAMPLING (nearest), not averaging.
@@ -247,24 +350,25 @@ def _make_wan_tile_wrapper(tiling_cfg, existing_wrapper, debug=False,
         # flow- and eps-parameterised models).  The clean conditioning tensors
         # below are signal, not noise, so they use antialiased `area`.
         x_small = _resize_spatial(x_full, oh, ow, "nearest-exact").contiguous()
-        c = dict(input_dict.get("c", {}))
+        c = dict(c)
         for key in ("c_concat", "reference_latent", "vace_context"):
             v = c.get(key, None)
-            if isinstance(v, torch.Tensor) and v.shape[-2] == H and v.shape[-1] == W:
-                c[key] = _resize_spatial(v, oh, ow, "area").contiguous()
+            if isinstance(v, torch.Tensor):
+                # Mask planes sit at a per-node position → pick the mode per plane.
+                axis = _COND_PLANE_AXIS.get((key, v.dim()))
+                if axis is None:
+                    c[key] = _resize_spatial(v, oh, ow, "area").contiguous()
+                else:
+                    c[key] = _resize_cond_planes(v, oh, ow, axis).contiguous()
         dm = c.get("denoise_mask", None)
-        if isinstance(dm, torch.Tensor) and dm.shape[-2] == H and dm.shape[-1] == W:
+        if isinstance(dm, torch.Tensor):
             c["denoise_mask"] = _resize_spatial(dm, oh, ow, "nearest-exact").contiguous()
 
         d = {**input_dict, "input": x_small, "c": c}
         pred = _call_model(model_fn, d)
-        # Always hand the sampler a full-resolution prediction: the sampler's
-        # latent state stays full-res across the whole run (and across WAN 2.2
-        # high/low-noise sampler passes), so the downscale never persists — the
-        # next pass always receives a full-res latent regardless of its schedule.
-        if isinstance(pred, torch.Tensor) and pred.shape[-2:] != (H, W):
-            pred = _resize_spatial(pred, H, W, "bilinear")
-        return pred.to(x_full.dtype) if isinstance(pred, torch.Tensor) else pred
+        # Always hand the sampler a full-resolution prediction — see
+        # _restore_full_res for why (shared with the kijai multiscale path).
+        return _restore_full_res(pred, H, W, x_full.dtype)
 
     def _run_tiled(model_fn, input_dict, tile_specs):
         x_full = input_dict["input"]
