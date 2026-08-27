@@ -1,0 +1,22 @@
+# Optional — only needed for the Qwen3-VL nodes (vlm_qwen3.py), and only if you
+# want in-process inference instead of the managed llama-server fallback.
+#
+# It is deliberately NOT in pyproject.toml: llama-cpp-python builds are large
+# and platform-specific, and installing MagoNodes must not depend on one.
+#
+# The wheel must be vision-capable, i.e. llama_cpp.llama_chat_format must
+# expose Qwen3VLChatHandler or Qwen25VLChatHandler. Plain PyPI wheels often do
+# not. Verify with:
+#
+#   python -c "from llama_cpp import llama_chat_format as f; \
+#              print([n for n in dir(f) if n.endswith('ChatHandler')])"
+#
+# If no Qwen-VL handler is listed, skip this file entirely and use a llama.cpp
+# `llama-server` binary instead:
+#
+#   set MAGO_LLAMA_SERVER=C:\path\to\llama-server.exe
+#
+# The nodes try llama-cpp-python first and fall back to llama-server
+# automatically, so either route works.
+
+llama-cpp-python

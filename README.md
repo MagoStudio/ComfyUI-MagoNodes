@@ -8,6 +8,9 @@ MagoStudio nodes for ComfyUI:
   LTX-Video, as a model patch for the vanilla `SamplerCustomAdvanced`.
 - **Save / Load Conditioning** — cache text-encoder output to disk so a
   fixed-prompt workflow can skip loading the text encoder.
+- **Qwen3-VL Caption** — a local vision-language model (GGUF) that returns
+  generated **text** through the ComfyUI HTTP API, for captioning and
+  prompt-writing.
 
 ## WAN Tiled Sampler
 
@@ -219,6 +222,61 @@ drop it too. The nodes are prompt/model-agnostic: they cache any `CONDITIONING`.
 
 > Note: `Load Conditioning` uses `torch.load(..., weights_only=False)` because
 > conditioning dicts hold non-tensor metadata — load only your own cache files.
+
+## Qwen3-VL Caption
+
+Two nodes (under **Mago Nodes/VLM**) that run a local Qwen3-VL GGUF and return the
+generated text. Unlike every other node here, the point is the **API**: the
+caption node is an `OUTPUT_NODE` emitting `{"ui": {"text": [...]}}`, so an HTTP
+client can `POST /prompt` and read the string back from
+`/history/<id>` at `outputs["<node_id>"]["text"][0]`. That is how the MagoLocal
+desktop app does image/video captioning, AutoPrompt and prompt-enhance without a
+cloud LLM.
+
+- **Load Qwen3-VL (Mago)** — `gguf_name` + `mmproj_name` (+ `n_ctx`,
+  `n_gpu_layers`) → `MAGO_VLM`. The model is cached module-level and stays
+  resident across graph executions, so repeated captions don't re-pay the load.
+- **Qwen3-VL Caption (Mago)** — `vlm`, `system_prompt`, `user_prompt`,
+  `max_tokens`, `temperature`, `top_p`, `seed`, plus up to four optional
+  `image1`…`image4` inputs → `STRING`.
+
+Separate image slots rather than one `IMAGE` batch, because callers mix
+resolutions — a video captioner sends a full-res first frame next to smaller
+frame-grid montages, and batching would force them to a common size.
+
+> API callers should send a **fresh `seed` per request**. An identical graph is
+> served from ComfyUI's execution cache, which would return the previous
+> caption.
+
+### Models
+
+Put the weights anywhere under `ComfyUI/models/LLM/` (the folder is created on
+first load and scanned recursively). Tested pairing:
+
+```
+ComfyUI/models/LLM/GGUF/Qwen3-VL-2B-Instruct-UD-Q8_K_XL.gguf   (2.3 GB)
+ComfyUI/models/LLM/GGUF/mmproj-BF16.gguf
+```
+
+from [unsloth/Qwen3-VL-2B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-VL-2B-Instruct-GGUF).
+`Qwen3-VL-2B-Instruct-Q8_0.gguf` also works; the UD (Unsloth Dynamic) quant is
+generally the better of the two at the same bit width.
+
+### Inference backend
+
+The nodes try two runners, in order:
+
+1. **llama-cpp-python** — in-process, nothing else to manage. Requires a
+   *vision-capable* wheel, i.e. `llama_cpp.llama_chat_format` must expose
+   `Qwen3VLChatHandler` or `Qwen25VLChatHandler`. Plain PyPI wheels often don't.
+2. **`llama-server`** — a llama.cpp binary the node starts and supervises,
+   talking OpenAI-compatible `/v1/chat/completions` to it on a private
+   localhost port. Set `MAGO_LLAMA_SERVER` to the binary path (otherwise it is
+   looked up on `PATH`).
+
+Vision support in llama-cpp-python lags llama.cpp and is awkward to install on
+Windows, so (2) is what makes this usable without hunting for a wheel. See
+[requirements-vlm.txt](requirements-vlm.txt).
 
 ## References
 
