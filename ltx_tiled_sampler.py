@@ -1,5 +1,6 @@
 import math
 import torch
+import comfy.utils
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,6 +299,28 @@ def _make_ltx_tile_wrapper(tiling_cfg, existing_wrapper, debug=False):
 
     def wrapper(model_fn, input_dict):
         x_full = input_dict['input']
+        base_c = input_dict.get('c', {})
+        packed_streams = None
+        latent_shapes = base_c.get('latent_shapes', None)
+
+        # Newer ComfyUI packs LTX audio/video streams into [B, 1, N] before
+        # model_function_wrapper hooks run. Recover the video grid for tiling.
+        if (
+            isinstance(x_full, torch.Tensor)
+            and x_full.dim() == 3
+            and isinstance(latent_shapes, (list, tuple))
+            and latent_shapes
+        ):
+            try:
+                unpacked = comfy.utils.unpack_latents(x_full, latent_shapes)
+                if unpacked and unpacked[0].dim() == 5:
+                    packed_streams = unpacked
+            except Exception:
+                if debug:
+                    import traceback
+                    print(f"[LTXTiled] packed latent unpack failed\n{traceback.format_exc()}")
+
+        video_full = packed_streams[0] if packed_streams is not None else x_full
 
         # One-time confirmation that the patch is actually being invoked by the
         # sampler.  A model patch can silently fail to propagate (no error, just
@@ -309,23 +332,31 @@ def _make_ltx_tile_wrapper(tiling_cfg, existing_wrapper, debug=False):
             chained = " (chaining an existing wrapper)" if existing_wrapper is not None else ""
             print(f"[LTXTiled] wrapper INVOKED — first model call, input={shape}{chained}")
 
-        if not isinstance(x_full, torch.Tensor) or x_full.dim() != 5:
+        if not isinstance(video_full, torch.Tensor) or video_full.dim() != 5:
             if debug:
                 print(f"[LTXTiled] passthrough — input is not a 5D video latent; not tiling")
             return _call(model_fn, input_dict)  # not a 5D video latent — passthrough
 
-        B, C, F, H, W = x_full.shape
+        if debug and packed_streams is not None:
+            print(f"[LTXTiled] unpacked packed latent: video={tuple(video_full.shape)} "
+                  f"streams={len(packed_streams)}")
+
+        B, C, F, H, W = video_full.shape
         tile_specs = _get_specs(F, H, W)
         if len(tile_specs) <= 1:
             if debug:
                 print(f"[LTXTiled] passthrough — latent {F}×{H}×{W} yields a single tile; not tiling")
             return _call(model_fn, input_dict)
 
-        dtype  = x_full.dtype
-        device = x_full.device
+        dtype  = video_full.dtype
+        device = video_full.device
         accum = torch.zeros(B, C, F, H, W, dtype=torch.float32, device=device)
         w_acc = torch.zeros(1, 1, F, H, W, dtype=torch.float32, device=device)
-        base_c = input_dict.get('c', {})
+        auxiliary_accums = (
+            [torch.zeros_like(stream, dtype=torch.float32) for stream in packed_streams[1:]]
+            if packed_streams is not None else []
+        )
+        valid_tiles = 0
 
         for spec in tile_specs:
             ts, te = spec['t_start'], spec['t_end']
@@ -333,7 +364,7 @@ def _make_ltx_tile_wrapper(tiling_cfg, existing_wrapper, debug=False):
             ws, we = spec['w_start'], spec['w_end']
             window_3d = spec['window_3d'].to(device=device, dtype=torch.float32)
 
-            tile_x = x_full[:, :, ts:te, hs:he, ws:we].contiguous()
+            tile_video = video_full[:, :, ts:te, hs:he, ws:we].contiguous()
             tile_c = _adapt_guide_for_tile(
                 base_c, ts, te, hs, he, ws, we,
                 spec['H_full'], spec['W_full'], debug=debug)
@@ -352,18 +383,49 @@ def _make_ltx_tile_wrapper(tiling_cfg, existing_wrapper, debug=False):
                 except Exception:
                     pass
 
-            tile_pred = _call(model_fn, {**input_dict, 'input': tile_x, 'c': tile_c})
+            tile_shapes = None
+            if packed_streams is not None:
+                tile_x, tile_shapes = comfy.utils.pack_latents(
+                    [tile_video, *packed_streams[1:]])
+                tile_c = dict(tile_c)
+                tile_c['latent_shapes'] = tile_shapes
+            else:
+                tile_x = tile_video
 
-            if isinstance(tile_pred, torch.Tensor) and tile_pred.shape == tile_x.shape:
+            packed_pred = _call(model_fn, {**input_dict, 'input': tile_x, 'c': tile_c})
+            pred_streams = None
+            if packed_streams is not None and tile_shapes is not None:
+                try:
+                    pred_streams = comfy.utils.unpack_latents(packed_pred, tile_shapes)
+                    tile_pred = pred_streams[0]
+                except Exception:
+                    tile_pred = packed_pred
+            else:
+                tile_pred = packed_pred
+
+            if isinstance(tile_pred, torch.Tensor) and tile_pred.shape == tile_video.shape:
                 accum[:, :, ts:te, hs:he, ws:we] += tile_pred.float() * window_3d
                 w_acc[:, :, ts:te, hs:he, ws:we] += window_3d
+                if pred_streams is not None:
+                    for aux_accum, aux_pred in zip(auxiliary_accums, pred_streams[1:]):
+                        aux_accum += aux_pred.float()
+                valid_tiles += 1
             elif debug:
                 info = (tuple(tile_pred.shape) if isinstance(tile_pred, torch.Tensor)
                         else type(tile_pred).__name__)
                 print(f"    [ltx_tile] tile [{ts}:{te},{hs}:{he},{ws}:{we}] "
-                      f"pred shape mismatch: {info} vs {tuple(tile_x.shape)}")
+                      f"pred shape mismatch: {info} vs {tuple(tile_video.shape)}")
 
-        return (accum / w_acc.clamp(min=1e-8)).to(dtype)
+        video_result = (accum / w_acc.clamp(min=1e-8)).to(dtype)
+        if packed_streams is not None:
+            if valid_tiles == 0:
+                return _call(model_fn, input_dict)
+            auxiliary_results = [
+                (aux_accum / valid_tiles).to(stream.dtype)
+                for aux_accum, stream in zip(auxiliary_accums, packed_streams[1:])
+            ]
+            return comfy.utils.pack_latents([video_result, *auxiliary_results])[0]
+        return video_result
 
     return wrapper
 
