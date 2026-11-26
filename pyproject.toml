@@ -1,7 +1,7 @@
 [project]
 name = "magonodes"
 description = "MagoStudio Nodes for ComfyUI"
-version = "0.3.0"
+version = "0.4.0"
 license = {file = "LICENSE"}
 dependencies = []
 
