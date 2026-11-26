@@ -8,6 +8,71 @@ MagoStudio nodes for ComfyUI:
   LTX-Video, as a model patch for the vanilla `SamplerCustomAdvanced`.
 - **Save / Load Conditioning** — cache text-encoder output to disk so a
   fixed-prompt workflow can skip loading the text encoder.
+- **Sol³ Sparse Attention (Mago)** — a model patch for native Wan, LTX and MiniMax H3.
+
+## Sol³ Sparse Attention (Mago)
+
+Connect `Load Diffusion Model → Sol³ Sparse Attention (Mago) → sampler or guider`.
+Search for `sol3` under **Mago Nodes / Sampling**. For Wan 2.2 workflows with
+separate high- and low-noise models, put one patch on each model line. In an H3
+workflow that already uses **Block Sparse Attention**, replace that node with Sol³.
+An existing **Model Attention Backend** can still supply the fallback.
+
+| Input | Default | Effect |
+| --- | --- | --- |
+| `dense_steps` | 1 | Use the model's original attention for the first steps of each sampler pass. Set to 0 to start Sol³ immediately. |
+| `min_tokens` | 4096 | Use the original attention for shorter sequences. Set to 0 to try Sol³ on a small test latent. |
+| `dense_first_blocks` | 1 | Use the original attention in this many leading transformer blocks on every step. Set to 0 to make every block eligible for Sol³ after warmup. |
+
+The default protects block 0, following the Sol³ paper. For **eight-step HyperFlow H3**,
+start with `dense_steps = 2`, `dense_first_blocks = 2` and `min_tokens = 4096`.
+Steps 1–2 use the existing attention backend throughout. On steps 3–8, blocks
+0 and 1 keep that backend, and Sol³ can run from block 2 onward. These step and
+block settings come from HyperFlow's Sol-Attn recipe.
+[Sol³ paper, Appendix B.2](https://arxiv.org/html/2611.32562v1#A2.SS2)
+and [HyperFlow attention settings](https://github.com/Video-Rebirth/hyperflow#sol-attn).
+
+The patch targets standard bidirectional Wan self-attention, LTX video
+self-attention and MiniMax H3 joint attention. The model must use 128-dimensional
+attention heads. H3 text, keyframe, reference and audio tokens form a protected
+prefix. Its queries receive dense attention and its keys and values stay exact
+for video queries. LTX guide masks and cross-attention use the existing backend.
+FP16 and BF16 activations are supported. Sol³ computes in BF16 and the patch
+returns the original activation dtype. The ComfyUI console reports the number
+of sparse calls after each sampler pass.
+
+### Pika Flex Ref2VA benchmark
+
+On an RTX 5090, Sol³ reduced sampler time by **11.6% for 5 s, 29.7% for 10 s and
+33.5% for 15 s** against H3's usual attention. The 15-second clip took 396.07 s
+with Sol³ and 595.77 s with usual attention. Each duration had one measured pair
+after warmup, using the eight-step Pika Flex Turbo HD Ref2VA LoRA at 720p without PDD.
+
+[Sample ComfyUI workflow](example_workflows/pika_ref2va_8step_720p_5s_attention_benchmark.json)
+· [Full results, settings and reproduction steps](benchmarks/pika_ref2va/README.md)
+
+<a id="sol3-installation"></a>
+
+### Sol³ installation
+
+Only this node needs the optional `sol3-attn` package. The upstream kernels
+require CUDA PyTorch 2.5.1+, Triton 3.1+ and an NVIDIA GPU with compute capability
+**8.0 (SM80)** or **12.0 (SM120)**. SM80 additionally requires
+`flashinfer-python==0.3.1`. Triton compiles kernels on the first run.
+[Sol³ repository and hardware requirements](https://github.com/FofGofx/sol3)
+
+On **Windows portable with SM120** (for example an RTX 5090), run this from the
+folder containing `python_embeded` after installing a compatible CUDA PyTorch
+and `triton-windows`. The command uses those installed packages.
+
+```powershell
+.\python_embeded\python.exe -m pip install --no-deps --no-build-isolation "git+https://github.com/FofGofx/sol3.git@21a509a1cf232168fefddcc06983ee1456588bca"
+```
+
+On **Linux**, use the Python environment that runs ComfyUI. For SM120 run
+`python -m pip install "sol3-attn @ git+https://github.com/FofGofx/sol3.git@21a509a1cf232168fefddcc06983ee1456588bca"`.
+For SM80 use `sol3-attn[sm80]` in the same command to install FlashInfer.
+Restart ComfyUI after installation.
 
 ## WAN Tiled Sampler
 
@@ -58,7 +123,7 @@ ComfyUI:
 ComfyUI/custom_nodes/ComfyUI-MagoNodes/
 ```
 
-There are no extra dependencies.
+The tiled samplers have no extra dependencies.
 
 ### Usage
 
