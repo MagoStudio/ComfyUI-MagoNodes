@@ -1,0 +1,513 @@
+{
+  "1": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Ref2VA diffusion model",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "2": {
+    "inputs": {
+      "lora_name": "pika_h3_flex_turbo_8step_hd_ref2va.safetensors",
+      "strength_model": 1,
+      "model": [
+        "21",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Pika Flex Turbo HD Ref2VA",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "3": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 3,
+      "model": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "Flow shifts",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "4": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "MiniMax text encoder",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "5": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Video VAE",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "6": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Audio VAE",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "7": {
+    "inputs": {
+      "image": "pika_gate_Whiskers__The_Noir_Cat_Detective.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Noir detective reference",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "8": {
+    "inputs": {
+      "prompt": "Use the cat detective in <Picture 1> as the character reference. A continuous wide shot of a rain-soaked alley at night. The detective takes three measured steps through shallow puddles, stops under a streetlamp, and turns to look over one shoulder. The camera tracks slowly alongside. Steady rain and a soft wet footstep in sync with each paw touching the ground.",
+      "width": 1280,
+      "height": 736,
+      "length": 124,
+      "ref_image_size": "max",
+      "clip": [
+        "4",
+        0
+      ],
+      "vae": [
+        "5",
+        0
+      ],
+      "audio_vae": [
+        "6",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "_meta": {
+      "title": "Ref2VA prompt and generation canvas",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "9": {
+    "inputs": {
+      "noise_seed": 878176171229895
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "Shared noise seed",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "10": {
+    "inputs": {
+      "model": [
+        "3",
+        0
+      ],
+      "conditioning": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "CFG 1 guider",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "11": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "Euler sampler",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "12": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 8,
+      "denoise": 1,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "Eight-step schedule",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "13": {
+    "inputs": {
+      "noise": [
+        "9",
+        0
+      ],
+      "guider": [
+        "10",
+        0
+      ],
+      "sampler": [
+        "11",
+        0
+      ],
+      "sigmas": [
+        "12",
+        0
+      ],
+      "latent_image": [
+        "8",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "Sample with usual attention",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "14": {
+    "inputs": {
+      "samples": [
+        "13",
+        0
+      ],
+      "vae": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "Decode video",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "15": {
+    "inputs": {
+      "samples": [
+        "13",
+        0
+      ],
+      "vae": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "Decode audio",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "16": {
+    "inputs": {
+      "fps": 24,
+      "bit_depth": "auto",
+      "color_space": "sRGB",
+      "chroma_subsampling": "auto",
+      "codec": "none",
+      "images": [
+        "34",
+        0
+      ],
+      "audio": [
+        "35",
+        0
+      ]
+    },
+    "class_type": "CreateVideo",
+    "_meta": {
+      "title": "Mux at 24 fps",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "17": {
+    "inputs": {
+      "filename_prefix": "benchmarks/pika_ref2va_720p5s/usual",
+      "format": "mp4",
+      "format.codec": "auto",
+      "codec": "auto",
+      "video": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "SaveVideo",
+    "_meta": {
+      "title": "Save usual attention MP4",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "21": {
+    "inputs": {
+      "chunks": 2,
+      "seq_threshold": 4096,
+      "model": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "MiniMaxChunkFeedForward",
+    "_meta": {
+      "title": "Chunked feed-forward"
+    }
+  },
+  "31": {
+    "inputs": {
+      "dense_steps": 2,
+      "min_tokens": 4096,
+      "dense_first_blocks": 2,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "MagoSol3Attention",
+    "_meta": {
+      "title": "Sol³ sparse attention",
+      "cnr_id": "magonodes"
+    }
+  },
+  "33": {
+    "inputs": {
+      "batch_index": 0,
+      "length": 120,
+      "image": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "ImageFromBatch",
+    "_meta": {
+      "title": "Keep first 120 frames",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "34": {
+    "inputs": {
+      "width": 1280,
+      "height": 720,
+      "x": 0,
+      "y": 8,
+      "image": [
+        "33",
+        0
+      ]
+    },
+    "class_type": "ImageCrop",
+    "_meta": {
+      "title": "Center crop to 720p",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "35": {
+    "inputs": {
+      "start_index": 0,
+      "duration": 5,
+      "audio": [
+        "15",
+        0
+      ]
+    },
+    "class_type": "TrimAudioDuration",
+    "_meta": {
+      "title": "Keep first five seconds",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "110": {
+    "inputs": {
+      "model": [
+        "31",
+        0
+      ],
+      "conditioning": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "CFG 1 guider",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "113": {
+    "inputs": {
+      "noise": [
+        "9",
+        0
+      ],
+      "guider": [
+        "110",
+        0
+      ],
+      "sampler": [
+        "11",
+        0
+      ],
+      "sigmas": [
+        "12",
+        0
+      ],
+      "latent_image": [
+        "8",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "Sample with Sol³",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "114": {
+    "inputs": {
+      "samples": [
+        "113",
+        0
+      ],
+      "vae": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "Decode video",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "115": {
+    "inputs": {
+      "samples": [
+        "113",
+        0
+      ],
+      "vae": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "Decode audio",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "116": {
+    "inputs": {
+      "fps": 24,
+      "bit_depth": "auto",
+      "color_space": "sRGB",
+      "chroma_subsampling": "auto",
+      "codec": "none",
+      "images": [
+        "134",
+        0
+      ],
+      "audio": [
+        "135",
+        0
+      ]
+    },
+    "class_type": "CreateVideo",
+    "_meta": {
+      "title": "Mux at 24 fps",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "117": {
+    "inputs": {
+      "filename_prefix": "benchmarks/pika_ref2va_720p5s/sol3",
+      "format": "mp4",
+      "format.codec": "auto",
+      "codec": "auto",
+      "video": [
+        "116",
+        0
+      ]
+    },
+    "class_type": "SaveVideo",
+    "_meta": {
+      "title": "Save Sol³ MP4",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "133": {
+    "inputs": {
+      "batch_index": 0,
+      "length": 120,
+      "image": [
+        "114",
+        0
+      ]
+    },
+    "class_type": "ImageFromBatch",
+    "_meta": {
+      "title": "Keep first 120 frames",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "134": {
+    "inputs": {
+      "width": 1280,
+      "height": 720,
+      "x": 0,
+      "y": 8,
+      "image": [
+        "133",
+        0
+      ]
+    },
+    "class_type": "ImageCrop",
+    "_meta": {
+      "title": "Center crop to 720p",
+      "cnr_id": "comfy-core"
+    }
+  },
+  "135": {
+    "inputs": {
+      "start_index": 0,
+      "duration": 5,
+      "audio": [
+        "115",
+        0
+      ]
+    },
+    "class_type": "TrimAudioDuration",
+    "_meta": {
+      "title": "Keep first five seconds",
+      "cnr_id": "comfy-core"
+    }
+  }
+}
